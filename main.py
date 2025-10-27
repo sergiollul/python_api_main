@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import json, requests
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GAuthRequest
+from typing import List
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -359,32 +360,34 @@ def desired_state(user=Depends(get_current_user)):
 
     with engine.connect() as conn:
         row = conn.execute(text("""
-            WITH S AS (SELECT :sid::bigint AS sid),
-            agg AS (
-                SELECT
-                  -- priority: any LOCK → LOCK, else any UNLOCK → UNLOCK, else NULL
-                  CASE
-                    WHEN SUM((want_lock = 'LOCK')::int)   > 0 THEN 'LOCK'
-                    WHEN SUM((want_lock = 'UNLOCK')::int) > 0 THEN 'UNLOCK'
-                    ELSE NULL
-                  END AS want_lock,
-
-                  -- last known device state picked by most recent device_state_updated_at
-                  (SELECT sc2.is_locked
-                     FROM numbux.student_classroom sc2
-                    WHERE sc2.id_student = (SELECT sid FROM S)
-                    ORDER BY sc2.device_state_updated_at DESC NULLS LAST
-                    LIMIT 1) AS is_locked
-                FROM numbux.student_classroom sc
-               WHERE sc.id_student = (SELECT sid FROM S)
+            WITH candidates AS (
+                SELECT id_classroom, want_lock, is_locked, updated_at
+                  FROM numbux.student_classroom
+                 WHERE id_student = :sid
+            ),
+            pending AS (
+                SELECT *
+                  FROM candidates
+                 WHERE want_lock IS NOT NULL
+                 ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
+                 LIMIT 1
             )
-            SELECT * FROM agg
+            SELECT
+                COALESCE((SELECT want_lock FROM pending),
+                         NULL)               AS want_lock,
+                (SELECT is_locked FROM candidates
+                  ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
+                  LIMIT 1)                  AS is_locked
         """), {"sid": user["user_id"]}).mappings().first()
 
+    # if the student has no rows at all
     if not row:
-        raise HTTPException(404, "Student not found or not linked to any classroom")
+        return {"want_lock": None, "is_locked": None}
 
-    return {"want_lock": row["want_lock"], "is_locked": row["is_locked"]}
+    return {
+        "want_lock": row["want_lock"],     # "LOCK" | "UNLOCK" | None
+        "is_locked": row["is_locked"],     # bool | None
+    }
 
 class AckBody(BaseModel):
     result: str   # "LOCKED" | "UNLOCKED" | "ERROR"
@@ -400,24 +403,22 @@ def lock_ack(body: AckBody, user=Depends(get_current_user)):
         is_locked = True
     elif body.result == "UNLOCKED":
         is_locked = False
+    elif body.result == "ERROR":
+        # do not flip is_locked, just clear the pending order if you want
+        pass
+    else:
+        raise HTTPException(400, "result must be LOCKED | UNLOCKED | ERROR")
 
     with engine.begin() as conn:
-        # 1) persist device state across ALL relationships for this student
-        conn.execute(text("""
-            UPDATE numbux.student_classroom
-               SET is_locked = COALESCE(:is_locked, is_locked),
-                   device_state_updated_at = (now() AT TIME ZONE 'utc')
-             WHERE id_student = :sid
-        """), {"is_locked": is_locked, "sid": user["user_id"]})
-
-        # 2) clear any pending desired-state for this student
+        # Clear ALL pending orders for this student (or target only the most recent pending if you prefer)
         conn.execute(text("""
             UPDATE numbux.student_classroom
                SET want_lock = NULL,
-                   want_lock_updated_at = (now() AT TIME ZONE 'utc')
+                   is_locked = COALESCE(:is_locked, is_locked),
+                   updated_at = (now() AT TIME ZONE 'utc')
              WHERE id_student = :sid
                AND want_lock IS NOT NULL
-        """), {"sid": user["user_id"]})
+        """), {"is_locked": is_locked, "sid": user["user_id"]})
 
     return {"ok": True}
 
@@ -426,12 +427,14 @@ def lock_ack(body: AckBody, user=Depends(get_current_user)):
 app.include_router(mdm_router, prefix="/api")
 
 
-# === Teacher -> order lock/unlock ===
+# === Teacher -> order lock/unlock for an entire classroom ===
+from typing import List
+
 class OrderBody(BaseModel):
     action: str  # "LOCK" | "UNLOCK"
 
 @app.post("/api/teacher/classrooms/{classroom_id}/order")
-def teacher_order_classroom(classroom_id: int, body: OrderBody, user=Depends(get_current_user)):
+def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_current_user)):
     if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can order lock/unlock")
 
@@ -439,45 +442,32 @@ def teacher_order_classroom(classroom_id: int, body: OrderBody, user=Depends(get
     if action not in {"LOCK", "UNLOCK"}:
         raise HTTPException(400, "action must be LOCK or UNLOCK")
 
-    # (Optional) ensure teacher owns/controls the classroom
-    if user["role"] == "teacher":
-        with engine.connect() as conn:
-            owns = conn.execute(text("""
-                SELECT 1
-                  FROM numbux.teacher_classroom tc
-                 WHERE tc.id_teacher = :tid
-                   AND tc.id_classroom = :cid
-                 LIMIT 1
-            """), {"tid": user["user_id"], "cid": classroom_id}).scalar()
-        if not owns:
-            raise HTTPException(403, "You don't control this classroom")
-
-    # 1) mark desired state on all relationships of that classroom
+    # 1) set desired state for all students of the classroom
     with engine.begin() as conn:
         conn.execute(text("""
             UPDATE numbux.student_classroom
-               SET want_lock = :w,
-                   want_lock_updated_at = (now() AT TIME ZONE 'utc')
+               SET want_lock = :w, updated_at = (now() AT TIME ZONE 'utc')
              WHERE id_classroom = :cid
         """), {"w": action, "cid": classroom_id})
 
-        # 2) get tokens to wake devices
+        # 2) fetch tokens for all students in the class
         tokens = conn.execute(text("""
-            SELECT st.push_token
-              FROM numbux.student_classroom sc
-              JOIN numbux.student st ON st.id_student = sc.id_student
+            SELECT s.push_token
+              FROM numbux.student s
+              JOIN numbux.student_classroom sc
+                ON sc.id_student = s.id_student
              WHERE sc.id_classroom = :cid
-               AND st.push_token IS NOT NULL
+               AND s.push_token IS NOT NULL
         """), {"cid": classroom_id}).scalars().all()
 
-    for t in tokens:
+    # 3) wake each device (data-only ping)
+    for tok in tokens:
         try:
-            send_fcm(t, data={"ping": "1"})
+            send_fcm(tok, data={"ping": "1"})
         except Exception as e:
-            print(f"[FCM] error token={t[:12]}… {e}")
+            print(f"[FCM] send failed to one token: {e}")
 
     return {"ok": True, "notified": len(tokens)}
-
 
 
 # ======= SignUp models =======
