@@ -311,6 +311,50 @@ def my_teacher_classrooms(user=Depends(get_current_user)):
     # Pydantic will serialize date fields automatically
     return [dict(r) for r in rows]
 
+# === Teacher -> list students in a classroom ===
+from typing import List
+
+class StudentInClass(BaseModel):
+    id_student: int
+    full_name: str
+    code: str                  # we'll expose id_student as string here
+    is_locked: bool | None = None
+    want_lock: str | None = None  # 'LOCK' | 'UNLOCK' | None
+
+@app.get("/api/teacher/classrooms/{classroom_id}/students", response_model=List[StudentInClass])
+def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(403, "Only controllers can list students")
+
+    with engine.connect() as conn:
+        # If caller is a teacher, ensure the classroom belongs to them
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(404, "Classroom not found for this teacher")
+
+        rows = conn.execute(text("""
+            SELECT
+                s.id_student,
+                TRIM(COALESCE(s.first_name,'') || ' ' || COALESCE(s.first_last_name,'')) AS full_name,
+                s.id_student::text AS code,            -- <— use id_student as “code”
+                sc.is_locked,
+                sc.want_lock
+            FROM numbux.student_classroom sc
+            JOIN numbux.student s ON s.id_student = sc.id_student
+            WHERE sc.id_classroom = :cid
+            ORDER BY s.id_student
+        """), {"cid": classroom_id}).mappings().all()
+
+    return [dict(r) for r in rows]
+
+
+
 @app.get("/me")
 def me(user=Depends(get_current_user)):
     return user
