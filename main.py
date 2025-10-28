@@ -514,6 +514,62 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
     return {"ok": True, "notified": len(tokens)}
 
 
+@app.post("/api/teacher/classrooms/{classroom_id}/students/{student_id}/order")
+def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(403, "Only controllers can order lock/unlock")
+
+    action = (body.action or "").upper()
+    if action not in {"LOCK", "UNLOCK"}:
+        raise HTTPException(400, "action must be LOCK or UNLOCK")
+
+    with engine.begin() as conn:
+        # If caller is a teacher, ensure the classroom belongs to them
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(404, "Classroom not found for this teacher")
+
+        # Ensure the student is in that classroom
+        enrolled = conn.execute(text("""
+            SELECT 1
+              FROM numbux.student_classroom
+             WHERE id_classroom = :cid AND id_student = :sid
+             LIMIT 1
+        """), {"cid": classroom_id, "sid": student_id}).first()
+        if not enrolled:
+            raise HTTPException(404, "Student not in this classroom")
+
+        # 1) set desired state for this student
+        conn.execute(text("""
+            UPDATE numbux.student_classroom
+               SET want_lock = :w, updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_classroom = :cid
+               AND id_student   = :sid
+        """), {"w": action, "cid": classroom_id, "sid": student_id})
+
+        # 2) fetch this student's push token
+        tok = conn.execute(text("""
+            SELECT push_token
+              FROM numbux.student
+             WHERE id_student = :sid
+        """), {"sid": student_id}).scalar()
+
+    # 3) wake device (if token present)
+    if tok:
+        try:
+            send_fcm(tok, data={"ping": "1"})
+        except Exception as e:
+            print(f"[FCM] send failed: {e}")
+
+    return {"ok": True, "student_id": student_id, "action": action}
+
+
 # ======= SignUp models =======
 class BaseSignup(BaseModel):
     first_name: str
