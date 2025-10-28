@@ -238,20 +238,61 @@ def _fcm_access_token() -> str | None:
         print(f"[FCM] credentials error: {e}")
         return None
 
-def send_fcm(token: str, data: dict | None = None) -> tuple[bool, str]:
+def send_fcm(
+    token: str | None = None,
+    data: dict | None = None,
+    *,
+    topic: str | None = None,
+    collapse_key: str | None = None,
+    ttl_seconds: int = 0,                 # 0s -> deliver now or drop (no wait)
+) -> tuple[bool, str]:
     """
-    Send a data-only wake message to a single device token.
-    Returns (ok, msg). Never raises.
+    Send a data-only FCM message using HTTP v1.
+    - Use either `token` OR `topic` (one must be provided).
+    - data: dict[str, str] (will be converted to string values)
+    - Sets Android priority=HIGH and APNs priority=10 for wake behavior.
     """
-    import json, requests
     access = _fcm_access_token()
     if not access:
-        msg = "[FCM] skip send: no access token (creds invalid or unreadable)"
+        msg = "[FCM] skip send: no access token"
         print(msg)
         return (False, msg)
 
     url = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"
-    body = {"message": {"token": token, "data": data or {}}}
+
+    # FCM requires data values to be strings
+    data = {k: str(v) for k, v in (data or {}).items()}
+
+    message: dict = {
+        "data": data,
+        "android": {
+            "priority": "HIGH",
+            # collapse_key only if you pass it
+            **({"collapse_key": collapse_key} if collapse_key else {}),
+            "ttl": f"{ttl_seconds}s",
+        },
+        # For iOS clients (if any): make it a high-priority background data msg
+        "apns": {
+            "headers": {
+                "apns-priority": "10",          # high
+                # "apns-push-type": "background"  # uncomment if you need background on iOS
+            },
+            "payload": {
+                "aps": {
+                    "content-available": 1
+                }
+            }
+        }
+    }
+
+    if token:
+        message["token"] = token
+    elif topic:
+        message["topic"] = topic
+    else:
+        return (False, "[FCM] need token or topic")
+
+    body = {"message": message}
     headers = {
         "Authorization": f"Bearer {access}",
         "Content-Type": "application/json; UTF-8",
@@ -486,7 +527,8 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
     if action not in {"LOCK", "UNLOCK"}:
         raise HTTPException(400, "action must be LOCK or UNLOCK")
 
-    # 1) set desired state for all students of the classroom
+    now_iso = _now_utc().isoformat()
+
     with engine.begin() as conn:
         conn.execute(text("""
             UPDATE numbux.student_classroom
@@ -494,25 +536,35 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
              WHERE id_classroom = :cid
         """), {"w": action, "cid": classroom_id})
 
-        # 2) fetch tokens for all students in the class
-        tokens = conn.execute(text("""
-            SELECT s.push_token
+        rows = conn.execute(text("""
+            SELECT s.id_student, s.push_token
               FROM numbux.student s
               JOIN numbux.student_classroom sc
                 ON sc.id_student = s.id_student
              WHERE sc.id_classroom = :cid
-               AND s.push_token IS NOT NULL
-        """), {"cid": classroom_id}).scalars().all()
+        """), {"cid": classroom_id}).mappings().all()
 
-    # 3) wake each device (data-only ping)
-    for tok in tokens:
-        try:
-            send_fcm(tok, data={"ping": "1"})
-        except Exception as e:
-            print(f"[FCM] send failed to one token: {e}")
+    notified = 0
+    for r in rows:
+        sid = r["id_student"]
+        tok = r["push_token"]
+        if not tok:
+            continue
+        ok, _ = send_fcm(
+            token=tok,
+            data={
+                "type": "LOCK_ORDER",
+                "action": action,                 # "LOCK" | "UNLOCK"
+                "student_id": sid,
+                "classroom_id": classroom_id,
+                "ts": now_iso,
+            },
+            collapse_key="lock_order",            # optional; helps dedupe
+            ttl_seconds=0                         # deliver now
+        )
+        if ok: notified += 1
 
-    return {"ok": True, "notified": len(tokens)}
-
+    return {"ok": True, "notified": notified}
 
 @app.post("/api/teacher/classrooms/{classroom_id}/students/{student_id}/order")
 def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, user=Depends(get_current_user)):
@@ -523,29 +575,26 @@ def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, u
     if action not in {"LOCK", "UNLOCK"}:
         raise HTTPException(400, "action must be LOCK or UNLOCK")
 
+    now_iso = _now_utc().isoformat()
+
     with engine.begin() as conn:
-        # If caller is a teacher, ensure the classroom belongs to them
         if user["role"] == "teacher":
             own = conn.execute(text("""
-                SELECT 1
-                  FROM numbux.teacher_classroom
+                SELECT 1 FROM numbux.teacher_classroom
                  WHERE id_teacher = :tid AND id_classroom = :cid
                  LIMIT 1
             """), {"tid": user["user_id"], "cid": classroom_id}).first()
             if not own:
                 raise HTTPException(404, "Classroom not found for this teacher")
 
-        # Ensure the student is in that classroom
         enrolled = conn.execute(text("""
-            SELECT 1
-              FROM numbux.student_classroom
+            SELECT 1 FROM numbux.student_classroom
              WHERE id_classroom = :cid AND id_student = :sid
              LIMIT 1
         """), {"cid": classroom_id, "sid": student_id}).first()
         if not enrolled:
             raise HTTPException(404, "Student not in this classroom")
 
-        # 1) set desired state for this student
         conn.execute(text("""
             UPDATE numbux.student_classroom
                SET want_lock = :w, updated_at = (now() AT TIME ZONE 'utc')
@@ -553,22 +602,27 @@ def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, u
                AND id_student   = :sid
         """), {"w": action, "cid": classroom_id, "sid": student_id})
 
-        # 2) fetch this student's push token
         tok = conn.execute(text("""
             SELECT push_token
               FROM numbux.student
              WHERE id_student = :sid
         """), {"sid": student_id}).scalar()
 
-    # 3) wake device (if token present)
     if tok:
-        try:
-            send_fcm(tok, data={"ping": "1"})
-        except Exception as e:
-            print(f"[FCM] send failed: {e}")
+        send_fcm(
+            token=tok,
+            data={
+                "type": "LOCK_ORDER",
+                "action": action,
+                "student_id": student_id,
+                "classroom_id": classroom_id,
+                "ts": now_iso,
+            },
+            collapse_key="lock_order",
+            ttl_seconds=0
+        )
 
     return {"ok": True, "student_id": student_id, "action": action}
-
 
 # ======= SignUp models =======
 class BaseSignup(BaseModel):
