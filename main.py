@@ -3,7 +3,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone, date
 
-from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, text
@@ -15,6 +15,8 @@ import json, requests
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GAuthRequest
 from typing import List
+
+
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -62,6 +64,37 @@ app.include_router(classes_router, prefix="/api")
 
 # ======= /api/license/resolve (mounted under /api) =======
 from fastapi import APIRouter, Query
+
+# === Live websocket fanout (global process state) ===
+import json
+from typing import Dict, Set
+import anyio
+
+# classroom_id -> set of active websockets
+classroom_subs: Dict[int, Set[WebSocket]] = {}
+# (optional) teacher_id -> set(classroom_ids) if you later need it
+teacher_index: Dict[int, Set[int]] = {}
+
+async def ws_send(ws: WebSocket, payload: dict):
+    await ws.send_text(json.dumps(payload))
+
+def broadcast_to_classrooms(classroom_ids: list[int], payload: dict):
+    """
+    Can be called from normal (sync) endpoints.
+    It schedules the actual send on the WS task using anyio.from_thread.run.
+    """
+    sent = 0
+    for cid in classroom_ids:
+        # Copy to avoid 'set changed size during iteration'
+        for ws in classroom_subs.get(cid, set()).copy():
+            try:
+                anyio.from_thread.run(ws_send, ws, payload)
+                sent += 1
+            except Exception:
+                # socket may be closed; best effort
+                pass
+    return sent
+
 
 license_router = APIRouter()
 
@@ -132,6 +165,28 @@ class RefreshResponse(BaseModel):
 
 def _now_utc():
     return datetime.now(tz=timezone.utc)
+
+# === Live broadcast helpers (require: engine, _now_utc, broadcast_to_classrooms) ===
+def classrooms_for_student(conn, student_id: int) -> list[int]:
+    rows = conn.execute(text("""
+        SELECT id_classroom
+          FROM numbux.student_classroom
+         WHERE id_student = :sid
+    """), {"sid": student_id}).fetchall()
+    return [r[0] for r in rows]
+
+def broadcast_student_toggle(*, student_id: int, is_locked: bool):
+    # gather all classrooms for this student
+    with engine.connect() as conn:
+        cids = classrooms_for_student(conn, student_id)
+    payload = {
+        "type": "student_toggle",
+        "student_id": student_id,
+        "is_locked": is_locked,
+        "ts": _now_utc().isoformat(),
+    }
+    broadcast_to_classrooms(cids, payload)
+
 
 def create_access_token(payload: dict, minutes: int = JWT_EXPIRE_MIN) -> str:
     to_encode = payload.copy()
@@ -336,6 +391,76 @@ SQL_TEACHER_CLASSROOM = text("""
     ORDER BY c.id_classroom DESC
 """)
 
+# === Live websocket for teacher updates (place AFTER SQL_TEACHER_CLASSROOM) ===
+@app.websocket("/api/teacher/live")
+async def teacher_live(ws: WebSocket):
+    await ws.accept()
+
+    # --- Authenticate the websocket like /me ---
+    # Try: Authorization: Bearer <access_token>  OR  ?token=<access_token>
+    try:
+        token = None
+        auth = ws.headers.get("authorization")
+        if auth and auth.lower().startswith("bearer "):
+            token = auth.split()[1]
+        if not token:
+            token = ws.query_params.get("token")
+        if not token:
+            await ws.close(code=4401)  # unauthorized
+            return
+
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("typ") != "access":
+            await ws.close(code=4401)
+            return
+        if payload.get("role") != "teacher":
+            await ws.close(code=4403)  # forbidden
+            return
+
+        teacher_id = int(payload["sub"])
+
+        # --- Determine which classrooms this teacher owns ---
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT c.id_classroom
+                  FROM numbux.teacher_classroom tc
+                  JOIN numbux.classroom c ON c.id_classroom = tc.id_classroom
+                 WHERE tc.id_teacher = :tid
+            """), {"tid": teacher_id}).fetchall()
+        classroom_ids = [r[0] for r in rows]
+
+        # Subscribe this socket to each classroom
+        for cid in classroom_ids:
+            classroom_subs.setdefault(cid, set()).add(ws)
+
+        # Optional: send a hello
+        await ws.send_text(json.dumps({
+            "type": "hello",
+            "teacher_id": teacher_id,
+            "classrooms": classroom_ids,
+            "ts": _now_utc().isoformat()
+        }))
+
+        # Keep alive; you can listen for "ping" and reply "pong"
+        while True:
+            msg = await ws.receive_text()
+            if msg == "ping":
+                await ws.send_text("pong")
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        # Any error → close gracefully
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
+    finally:
+        # Unsubscribe on exit
+        for cid, sockets in list(classroom_subs.items()):
+            sockets.discard(ws)
+
+
 @app.get("/api/teacher/classrooms", response_model=list[TeacherClassroom])
 def my_teacher_classrooms(user=Depends(get_current_user)):
     if user["role"] != "teacher":
@@ -426,6 +551,10 @@ class PushTokenBody(BaseModel):
     device_id: str
     push_token: str
 
+class ToggleReport(BaseModel):
+    is_locked: bool
+    source: str | None = None  # e.g. 'STUDENT_TOGGLE'
+
 @mdm_router.post("/device/push-token")
 def update_push_token(body: PushTokenBody, user=Depends(get_current_user)):
     if user["role"] != "student":
@@ -488,14 +617,10 @@ def lock_ack(body: AckBody, user=Depends(get_current_user)):
         is_locked = True
     elif body.result == "UNLOCKED":
         is_locked = False
-    elif body.result == "ERROR":
-        # do not flip is_locked, just clear the pending order if you want
-        pass
-    else:
+    elif body.result != "ERROR":
         raise HTTPException(400, "result must be LOCKED | UNLOCKED | ERROR")
 
     with engine.begin() as conn:
-        # Clear ALL pending orders for this student (or target only the most recent pending if you prefer)
         conn.execute(text("""
             UPDATE numbux.student_classroom
                SET want_lock = NULL,
@@ -505,7 +630,32 @@ def lock_ack(body: AckBody, user=Depends(get_current_user)):
                AND want_lock IS NOT NULL
         """), {"is_locked": is_locked, "sid": user["user_id"]})
 
+    # If we actually changed lock state, tell teachers
+    if is_locked is not None:
+        broadcast_student_toggle(student_id=user["user_id"], is_locked=is_locked)
+
     return {"ok": True}
+
+
+
+@mdm_router.post("/device/toggle-report")
+def device_toggle_report(body: ToggleReport, user=Depends(get_current_user)):
+    if user["role"] != "student":
+        raise HTTPException(403, "Only students report their toggle")
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE numbux.student_classroom
+               SET is_locked = :locked,
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_student = :sid
+        """), {"locked": body.is_locked, "sid": user["user_id"]})
+
+    # live broadcast to all teacher sockets for this student
+    broadcast_student_toggle(student_id=user["user_id"], is_locked=body.is_locked)
+
+    return {"ok": True}
+
 
 
 # Mount under /api
