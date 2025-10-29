@@ -299,7 +299,7 @@ def send_fcm(
     *,
     topic: str | None = None,
     collapse_key: str | None = None,
-    ttl_seconds: int = 0,                 # 0s -> deliver now or drop (no wait)
+    ttl_seconds: int = 300,                 # 0s -> deliver now or drop (no wait)
 ) -> tuple[bool, str]:
     """
     Send a data-only FCM message using HTTP v1.
@@ -710,7 +710,7 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
                 "ts": now_iso,
             },
             collapse_key="lock_order",            # optional; helps dedupe
-            ttl_seconds=0                         # deliver now
+            ttl_seconds=300                       # ✅ queue up to ~5 minutes instead of drop
         )
         if ok: notified += 1
 
