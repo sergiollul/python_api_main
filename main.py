@@ -2,10 +2,9 @@
 import os
 import sys
 from datetime import datetime, timedelta, timezone, date
-
 from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect 
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError, ProgrammingError
 from passlib.hash import bcrypt
@@ -15,7 +14,7 @@ import json, requests
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GAuthRequest
 from typing import List
-
+import secrets, base64
 
 
 ENV_PATH = "/srv/numbux-api/.env"
@@ -60,7 +59,6 @@ app.add_middleware(
 # and run uvicorn with "app.main:app" + WorkingDirectory=/srv/numbux-api
 from app.routes_classes import router as classes_router
 app.include_router(classes_router, prefix="/api")
-
 
 # ======= /api/license/resolve (mounted under /api) =======
 from fastapi import APIRouter, Query
@@ -162,6 +160,37 @@ class RefreshRequest(BaseModel):
 class RefreshResponse(BaseModel):
     access_token: str
     refresh_token: str | None = None
+
+class JoinOpenRequest(BaseModel):
+    expires_in_minutes: int = Field(60, ge=5, le=7*24*60)  # 5 min … 7 days
+
+class JoinOpenResponse(BaseModel):
+    classroom_id: int
+    allow_join_student: bool
+    join_token: str
+    join_url: str
+    join_token_expires_at: datetime | None = None
+
+class JoinCloseResponse(BaseModel):
+    classroom_id: int
+    allow_join_student: bool
+
+class StudentJoinRequest(BaseModel):
+    token: str
+
+class JoinResolveResponse(BaseModel):
+    classroom_id: int
+    course: str | None = None
+    group: str | None = None
+    subject: str | None = None
+    center_name: str | None = None
+    allow_join_student: bool
+    join_token_expires_at: datetime | None = None
+
+
+def _gen_join_token(nbytes: int = 18) -> str:
+    # ~144 bits of entropy, URL-safe
+    return base64.urlsafe_b64encode(secrets.token_bytes(nbytes)).decode().rstrip("=")
 
 def _now_utc():
     return datetime.now(tz=timezone.utc)
@@ -381,11 +410,13 @@ SQL_TEACHER_CLASSROOM = text("""
            c.status,
            c.start_date::text AS start_date,
            c.end_date::text   AS end_date,
-           COALESCE(c.student_count, 0) AS students_count,  -- <— alias to match DTO
+           COALESCE(c.student_count, 0) AS students_count,  -- alias to match DTO
            c.course,
-           c."group" AS "group",                             -- keep quotes only if column is named group
-           c.subject
-    FROM numbux.teacher_classroom tc                         -- <— singular
+           c."group" AS "group",                            -- keep quotes only if column is named "group"
+           c.subject,
+           c.allow_join_student,                            -- ✅ new column
+           c.join_token_expires_at::text AS join_token_expires_at  -- ✅ new column
+    FROM numbux.teacher_classroom tc                        -- singular table name
     JOIN numbux.classroom c ON c.id_classroom = tc.id_classroom
     WHERE tc.id_teacher = :id_teacher
     ORDER BY c.id_classroom DESC
@@ -459,6 +490,156 @@ async def teacher_live(ws: WebSocket):
         # Unsubscribe on exit
         for cid, sockets in list(classroom_subs.items()):
             sockets.discard(ws)
+
+
+@app.post("/api/teacher/classrooms/{classroom_id}/join/open", response_model=JoinOpenResponse)
+def open_class_join(classroom_id: int, body: JoinOpenRequest, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(403, "Only controllers can open join")
+
+    expires_at = _now_utc() + timedelta(minutes=body.expires_in_minutes)
+    token = _gen_join_token()
+
+    with engine.begin() as conn:
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1 FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(404, "Classroom not found for this teacher")
+
+        # rotate token every time you open
+        conn.execute(text("""
+            UPDATE numbux.classroom
+               SET allow_join_student = TRUE,
+                   join_token = :tok,
+                   join_token_expires_at = :exp
+             WHERE id_classroom = :cid
+        """), {"tok": token, "exp": expires_at, "cid": classroom_id})
+
+        row = conn.execute(text("""
+            SELECT course, "group", subject
+              FROM numbux.classroom
+             WHERE id_classroom = :cid
+        """), {"cid": classroom_id}).mappings().first()
+
+    join_url = f"https://api.numbux.com/join?token={token}"
+    return {
+        "classroom_id": classroom_id,
+        "allow_join_student": True,
+        "join_token": token,
+        "join_url": join_url,
+        "join_token_expires_at": expires_at,
+    }
+
+
+@app.post("/api/teacher/classrooms/{classroom_id}/join/close", response_model=JoinCloseResponse)
+def close_class_join(classroom_id: int, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(403, "Only controllers can close join")
+
+    with engine.begin() as conn:
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1 FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(404, "Classroom not found for this teacher")
+
+        conn.execute(text("""
+            UPDATE numbux.classroom
+               SET allow_join_student = FALSE,
+                   join_token = NULL,
+                   join_token_expires_at = NULL
+             WHERE id_classroom = :cid
+        """), {"cid": classroom_id})
+
+    return {"classroom_id": classroom_id, "allow_join_student": False}
+
+@app.post("/api/student/join")
+def student_join(body: StudentJoinRequest, user=Depends(get_current_user)):
+    if user["role"] != "student":
+        raise HTTPException(403, "Only students can join")
+
+    token = (body.token or "").strip()
+    if not token:
+        raise HTTPException(400, "Missing token")
+
+    with engine.begin() as conn:
+        cls = conn.execute(text("""
+            SELECT c.id_classroom, c.allow_join_student, c.join_token_expires_at
+              FROM numbux.classroom c
+             WHERE c.join_token = :tok
+             LIMIT 1
+        """), {"tok": token}).mappings().first()
+
+        if not cls:
+            raise HTTPException(404, "Invalid token")
+        if not cls["allow_join_student"]:
+            raise HTTPException(403, "Class is not open for joining")
+        if cls["join_token_expires_at"] and cls["join_token_expires_at"] < _now_utc():
+            raise HTTPException(403, "Join link expired")
+
+        classroom_id = int(cls["id_classroom"])
+
+        # Already enrolled?
+        exists = conn.execute(text("""
+            SELECT 1 FROM numbux.student_classroom
+             WHERE id_classroom = :cid AND id_student = :sid
+             LIMIT 1
+        """), {"cid": classroom_id, "sid": user["user_id"]}).first()
+        if exists:
+            return {"ok": True, "classroom_id": classroom_id, "status": "already_enrolled"}
+
+        # Enroll
+        conn.execute(text("""
+            INSERT INTO numbux.student_classroom (id_classroom, id_student, status, updated_at)
+            VALUES (:cid, :sid, 'active', (now() AT TIME ZONE 'utc'))
+        """), {"cid": classroom_id, "sid": user["user_id"]})
+
+    # (Optional) audit & live update to teachers via your websocket fanout
+    broadcast_to_classrooms([classroom_id], {
+        "type": "student_joined",
+        "student_id": user["user_id"],
+        "ts": _now_utc().isoformat()
+    })
+
+    return {"ok": True, "classroom_id": classroom_id, "status": "enrolled"}
+
+@app.get("/api/join/resolve", response_model=JoinResolveResponse)
+def join_resolve(token: str):
+    token = (token or "").strip()
+    if not token:
+        raise HTTPException(400, "Missing token")
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT c.id_classroom, c.allow_join_student, c.join_token_expires_at,
+                   c.course, c."group", c.subject,
+                   ec.commercial_name AS center_name
+              FROM numbux.classroom c
+              LEFT JOIN numbux.educational_center ec ON ec.id_ec = c.id_ec
+             WHERE c.join_token = :tok
+             LIMIT 1
+        """), {"tok": token}).mappings().first()
+
+    if not row:
+        raise HTTPException(404, "Invalid token")
+
+    return {
+        "classroom_id": int(row["id_classroom"]),
+        "course": row.get("course"),
+        "group": row.get("group"),
+        "subject": row.get("subject"),
+        "center_name": row.get("center_name"),
+        "allow_join_student": bool(row["allow_join_student"]),
+        "join_token_expires_at": row.get("join_token_expires_at"),
+    }
+
 
 
 @app.get("/api/teacher/classrooms", response_model=list[TeacherClassroom])
