@@ -701,6 +701,42 @@ def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)
     return [dict(r) for r in rows]
 
 
+# === Student -> list their classrooms ===
+class StudentClassroomOut(BaseModel):
+    id_classroom: int
+    course: str | None = None
+    group: str | None = None
+    subject: str | None = None
+    teacher_name: str | None = None
+    students_count: int | None = None
+
+@app.get("/api/student/classrooms", response_model=list[StudentClassroomOut])
+def student_my_classrooms(user=Depends(get_current_user)):
+    if user["role"] != "student":
+        raise HTTPException(status_code=403, detail="Only students can list their classrooms")
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT
+                c.id_classroom,
+                c.course,
+                c."group" AS "group",                       -- ⚠️ quoted if the column is literally named "group"
+                c.subject,
+                COALESCE(c.student_count, 0) AS students_count,
+                (t.first_name || ' ' || t.last_name) AS teacher_name
+            FROM numbux.student_classroom sc
+            JOIN numbux.classroom c
+              ON c.id_classroom = sc.id_classroom
+            LEFT JOIN numbux.teacher_classroom tc
+              ON tc.id_classroom = c.id_classroom
+            LEFT JOIN numbux.teacher t
+              ON t.id_teacher = tc.id_teacher
+            WHERE sc.id_student = :sid
+            ORDER BY c.id_classroom DESC
+        """), {"sid": user["user_id"]}).mappings().all()
+
+    return [dict(r) for r in rows]
+
 
 @app.get("/me")
 def me(user=Depends(get_current_user)):
