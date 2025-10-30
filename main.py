@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, ProgrammingError
+from sqlalchemy.exc import SQLAlchemyError, ProgrammingError, IntegrityError
 from passlib.hash import bcrypt
 from jose import jwt, JWTError
 from dotenv import load_dotenv
@@ -15,7 +15,9 @@ from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GAuthRequest
 from typing import List
 import secrets, base64
-
+import logging
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError, ProgrammingError
+from typing import Literal
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -178,6 +180,11 @@ class JoinCloseResponse(BaseModel):
 class StudentJoinRequest(BaseModel):
     token: str
 
+class StudentJoinResponse(BaseModel):
+    ok: bool
+    classroom_id: int | None = None
+    status: str | None = None   # "enrolled" | "already_enrolled"
+
 class JoinResolveResponse(BaseModel):
     classroom_id: int
     course: str | None = None
@@ -186,6 +193,15 @@ class JoinResolveResponse(BaseModel):
     center_name: str | None = None
     allow_join_student: bool
     join_token_expires_at: datetime | None = None
+
+log = logging.getLogger("join")
+
+class JoinReq(BaseModel):
+    token: str
+
+class JoinResp(BaseModel):
+    joined: bool
+    classroom_id: int
 
 
 def _gen_join_token(nbytes: int = 18) -> str:
@@ -525,7 +541,7 @@ def open_class_join(classroom_id: int, body: JoinOpenRequest, user=Depends(get_c
              WHERE id_classroom = :cid
         """), {"cid": classroom_id}).mappings().first()
 
-    join_url = f"https://api.numbux.com/join?token={token}"
+    join_url = f"https://api.numbux.com/join?token={token}" #human-/QR-friendly
     return {
         "classroom_id": classroom_id,
         "allow_join_student": True,
@@ -560,55 +576,88 @@ def close_class_join(classroom_id: int, user=Depends(get_current_user)):
 
     return {"classroom_id": classroom_id, "allow_join_student": False}
 
-@app.post("/api/student/join")
-def student_join(body: StudentJoinRequest, user=Depends(get_current_user)):
-    if user["role"] != "student":
-        raise HTTPException(403, "Only students can join")
+@app.post("/api/student/join", response_model=StudentJoinResponse)
+def student_join(body: StudentJoinRequest, user = Depends(get_current_user)):
+    if not user or user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="Only students can join")
 
     token = (body.token or "").strip()
     if not token:
-        raise HTTPException(400, "Missing token")
+        raise HTTPException(status_code=400, detail="Missing token")
 
-    with engine.begin() as conn:
-        cls = conn.execute(text("""
-            SELECT c.id_classroom, c.allow_join_student, c.join_token_expires_at
-              FROM numbux.classroom c
-             WHERE c.join_token = :tok
-             LIMIT 1
-        """), {"tok": token}).mappings().first()
+    try:
+        with engine.begin() as conn:
+            cls = conn.execute(text("""
+                SELECT
+                    c.id_classroom,
+                    c.allow_join_student,
+                    c.join_token_expires_at
+                FROM numbux.classroom c
+                WHERE c.join_token = :tok
+                LIMIT 1
+            """), {"tok": token}).mappings().first()
 
-        if not cls:
-            raise HTTPException(404, "Invalid token")
-        if not cls["allow_join_student"]:
-            raise HTTPException(403, "Class is not open for joining")
-        if cls["join_token_expires_at"] and cls["join_token_expires_at"] < _now_utc():
-            raise HTTPException(403, "Join link expired")
+            if not cls:
+                raise HTTPException(status_code=404, detail="Invalid token")
 
-        classroom_id = int(cls["id_classroom"])
+            if not bool(cls["allow_join_student"]):
+                raise HTTPException(status_code=403, detail="Class is not open for joining")
 
-        # Already enrolled?
-        exists = conn.execute(text("""
-            SELECT 1 FROM numbux.student_classroom
-             WHERE id_classroom = :cid AND id_student = :sid
-             LIMIT 1
-        """), {"cid": classroom_id, "sid": user["user_id"]}).first()
-        if exists:
-            return {"ok": True, "classroom_id": classroom_id, "status": "already_enrolled"}
+            exp_at = cls["join_token_expires_at"]
+            if exp_at is not None:
+                now_ = _now_utc()
+                # handle naive vs aware
+                if getattr(exp_at, "tzinfo", None) is None:
+                    if exp_at < now_.replace(tzinfo=None):
+                        raise HTTPException(status_code=410, detail="Join link expired")
+                else:
+                    if exp_at < now_:
+                        raise HTTPException(status_code=410, detail="Join link expired")
 
-        # Enroll
-        conn.execute(text("""
-            INSERT INTO numbux.student_classroom (id_classroom, id_student, status, updated_at)
-            VALUES (:cid, :sid, 'active', (now() AT TIME ZONE 'utc'))
-        """), {"cid": classroom_id, "sid": user["user_id"]})
+            classroom_id = int(cls["id_classroom"])
+            student_id   = int(user["user_id"])
 
-    # (Optional) audit & live update to teachers via your websocket fanout
-    broadcast_to_classrooms([classroom_id], {
-        "type": "student_joined",
-        "student_id": user["user_id"],
-        "ts": _now_utc().isoformat()
-    })
+            exists = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.student_classroom
+                 WHERE id_classroom = :cid AND id_student = :sid
+                 LIMIT 1
+            """), {"cid": classroom_id, "sid": student_id}).first()
 
-    return {"ok": True, "classroom_id": classroom_id, "status": "enrolled"}
+            if exists:
+                return StudentJoinResponse(ok=True, classroom_id=classroom_id, status="already_enrolled")
+
+            try:
+                conn.execute(text("""
+                    INSERT INTO numbux.student_classroom
+                        (id_classroom, id_student, updated_at)
+                    VALUES
+                        (:cid, :sid, (now() AT TIME ZONE 'utc'))
+                """), {"cid": classroom_id, "sid": student_id})
+
+            except IntegrityError:
+                # race → treat as already enrolled
+                return StudentJoinResponse(ok=True, classroom_id=classroom_id, status="already_enrolled")
+
+        # (optional) broadcast, wrapped so it never 500s the join
+        try:
+            broadcast_to_classrooms([classroom_id], {
+                "type": "student_joined",
+                "student_id": student_id,
+                "ts": _now_utc().isoformat()
+            })
+        except Exception:
+            pass
+
+        return StudentJoinResponse(ok=True, classroom_id=classroom_id, status="enrolled")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # final safety net: turn unknown errors into a 400 with context during dev
+        # swap to 500 in prod if you prefer
+        raise HTTPException(status_code=500, detail=f"Join failed: {e.__class__.__name__}")
+
 
 @app.get("/api/join/resolve", response_model=JoinResolveResponse)
 def join_resolve(token: str):
@@ -616,16 +665,32 @@ def join_resolve(token: str):
     if not token:
         raise HTTPException(400, "Missing token")
 
-    with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT c.id_classroom, c.allow_join_student, c.join_token_expires_at,
-                   c.course, c."group", c.subject,
-                   ec.commercial_name AS center_name
-              FROM numbux.classroom c
-              LEFT JOIN numbux.educational_center ec ON ec.id_ec = c.id_ec
-             WHERE c.join_token = :tok
-             LIMIT 1
-        """), {"tok": token}).mappings().first()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT
+                    c.id_classroom,
+                    c.allow_join_student,
+                    c.join_token_expires_at,
+                    c.course,
+                    c."group" AS grp,
+                    c.subject,
+                    ec.commercial_name AS center_name
+                FROM numbux.classroom c
+                LEFT JOIN numbux.teacher_classroom tc
+                       ON tc.id_classroom = c.id_classroom
+                LEFT JOIN numbux.teacher_ec te
+                       ON te.id_teacher = tc.id_teacher
+                      AND (te.status ILIKE 'active' OR te.status IS NULL)
+                LEFT JOIN numbux.educational_center ec
+                       ON ec.id_ec = te.id_ec
+                WHERE c.join_token = :tok
+                ORDER BY te.start_date DESC NULLS LAST
+                LIMIT 1
+            """), {"tok": token}).mappings().first()
+    except Exception as e:
+        import logging; logging.exception("JOIN_RESOLVE DB error")
+        raise HTTPException(status_code=500, detail=f"resolve failed: {e.__class__.__name__}: {e}")
 
     if not row:
         raise HTTPException(404, "Invalid token")
@@ -633,13 +698,12 @@ def join_resolve(token: str):
     return {
         "classroom_id": int(row["id_classroom"]),
         "course": row.get("course"),
-        "group": row.get("group"),
+        "group": row.get("grp"),
         "subject": row.get("subject"),
         "center_name": row.get("center_name"),
         "allow_join_student": bool(row["allow_join_student"]),
         "join_token_expires_at": row.get("join_token_expires_at"),
     }
-
 
 
 @app.get("/api/teacher/classrooms", response_model=list[TeacherClassroom])
