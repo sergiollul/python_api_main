@@ -13,11 +13,10 @@ from dotenv import load_dotenv
 import json, requests
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GAuthRequest
-from typing import List
+from typing import List, Optional, Literal
 import secrets, base64
 import logging
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError, ProgrammingError
-from typing import Literal
+
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -210,6 +209,8 @@ def _gen_join_token(nbytes: int = 18) -> str:
 
 def _now_utc():
     return datetime.now(tz=timezone.utc)
+
+
 
 # === Live broadcast helpers (require: engine, _now_utc, broadcast_to_classrooms) ===
 def classrooms_for_student(conn, student_id: int) -> list[int]:
@@ -420,6 +421,83 @@ class TeacherClassroom(BaseModel):
     course: str | None = None
     group: str | None = None
     subject: str | None = None
+
+# === Teacher -> create classroom ===
+class ClassroomCreate(BaseModel):
+    course: Optional[str] = None
+    group: Optional[str] = Field(None, alias="group")  # "group" está entre comillas en SQL
+    subject: Optional[str] = None
+    status: Literal["active", "archived"] = "active"
+    start_date: Optional[date] = None  # por defecto: hoy UTC
+
+@app.post("/api/teacher/classrooms", response_model=TeacherClassroom)
+def create_classroom(body: ClassroomCreate, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only controllers can create classrooms")
+
+    # Fecha por defecto (UTC)
+    start_d = body.start_date or _now_utc().date()
+
+    with engine.begin() as conn:
+        # Validar que el profesor tenga centro activo
+        if user["role"] == "teacher":
+            te = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.teacher_ec
+                 WHERE id_teacher = :tid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"tid": user["user_id"]}).mappings().first()
+            if not te:
+                raise HTTPException(status_code=400, detail="Teacher has no active educational center")
+
+        # 1) Crear la clase
+        cid = conn.execute(text("""
+            INSERT INTO numbux.classroom
+                (status, start_date, end_date,
+                 student_count, course, "group", subject,
+                 allow_join_student, join_token, join_token_expires_at)
+            VALUES
+                (:status, :start_date, NULL,
+                 0, :course, :group, :subject,
+                 FALSE, NULL, NULL)
+            RETURNING id_classroom
+        """), {
+            "status": body.status,
+            "start_date": start_d,
+            "course": body.course,
+            "group": body.group,
+            "subject": body.subject,
+        }).scalar_one()
+
+        # 2) Vincular al profesor creador
+        if user["role"] == "teacher":
+            conn.execute(text("""
+                INSERT INTO numbux.teacher_classroom
+                    (id_teacher, id_classroom, role)
+                VALUES
+                    (:tid, :cid, 'Teacher/Creator')
+            """), {"tid": user["user_id"], "cid": cid})
+
+        # 3) Devolver el registro creado
+        row = conn.execute(text("""
+            SELECT c.id_classroom,
+                   c.status,
+                   c.start_date::text AS start_date,
+                   c.end_date::text   AS end_date,
+                   COALESCE(c.student_count, 0) AS students_count,
+                   c.course,
+                   c."group" AS "group",
+                   c.subject,
+                   c.allow_join_student,
+                   c.join_token_expires_at::text AS join_token_expires_at
+            FROM numbux.classroom c
+            WHERE c.id_classroom = :cid
+        """), {"cid": cid}).mappings().first()
+
+    return dict(row)
+
 
 SQL_TEACHER_CLASSROOM = text("""
     SELECT c.id_classroom,
