@@ -942,34 +942,34 @@ def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)
                 raise HTTPException(404, "Classroom not found for this teacher")
 
         rows = conn.execute(text("""
-    SELECT
-        s.id_student,
-        /* Build: "<first_last_name> <second_last_name>, <first_name>" */
-        CONCAT_WS(
-            ', ',
-            NULLIF(CONCAT_WS(' ',
-                NULLIF(s.first_last_name, ''),
-                NULLIF(s.second_last_name, '')
-            ), ''),
-            NULLIF(s.first_name, '')
-        ) AS full_name,
-        s.id_student::text AS code,
-        sc.is_locked,
-        sc.want_lock,
-        s.first_name,
-        s.first_last_name,
-        s.second_last_name
-    FROM numbux.student_classroom sc
-    JOIN numbux.student s ON s.id_student = sc.id_student
-    WHERE sc.id_classroom = :cid
-    ORDER BY
-        COALESCE(s.first_last_name, ''),
-        COALESCE(s.second_last_name, ''),
-        COALESCE(s.first_name, '')
-"""), {"cid": classroom_id}).mappings().all()
-
+            SELECT
+                s.id_student,
+                /* Build: "<first_last_name> <second_last_name>, <first_name>" */
+                CONCAT_WS(
+                    ', ',
+                    NULLIF(CONCAT_WS(' ',
+                        NULLIF(s.first_last_name, ''),
+                        NULLIF(s.second_last_name, '')
+                    ), ''),
+                    NULLIF(s.first_name, '')
+                ) AS full_name,
+                s.id_student::text AS code,
+                sc.is_locked,
+                sc.want_lock,
+                COALESCE(s.first_name, '') AS first_name,
+                COALESCE(s.first_last_name, '') AS first_last_name,
+                COALESCE(s.second_last_name, '') AS second_last_name
+            FROM numbux.student_classroom sc
+            JOIN numbux.student s ON s.id_student = sc.id_student
+            WHERE sc.id_classroom = :cid
+            ORDER BY
+                COALESCE(s.first_last_name, ''),
+                COALESCE(s.second_last_name, ''),
+                COALESCE(s.first_name, '')
+        """), {"cid": classroom_id}).mappings().all()
 
     return [dict(r) for r in rows]
+
 
 
 # === Student -> list their classrooms ===
@@ -1336,9 +1336,9 @@ def update_student_partial(student_id: int, body: StudentUpdate, user=Depends(ge
             row = conn.execute(text("""
                 SELECT
                     id_student,
-                    first_name,
-                    first_last_name,
-                    second_last_name,
+                    COALESCE(first_name, '') AS first_name,
+                    COALESCE(first_last_name, '') AS first_last_name,
+                    COALESCE(second_last_name, '') AS second_last_name,
                     CONCAT_WS(
                         ', ',
                         NULLIF(CONCAT_WS(' ',
