@@ -499,6 +499,87 @@ def create_classroom(body: ClassroomCreate, user=Depends(get_current_user)):
     return dict(row)
 
 
+# === Update classroom: course, group, subject (partial) ===
+class ClassroomUpdate(BaseModel):
+    # Accept partial updates; None means "no change".
+    course: Optional[str] = None
+    group: Optional[str] = Field(None, alias="group")  # quoted in SQL
+    subject: Optional[str] = None
+
+@app.patch("/api/teacher/classrooms/{classroom_id}", response_model=TeacherClassroom)
+def update_classroom(classroom_id: int, body: ClassroomUpdate, user=Depends(get_current_user)):
+    # Only controllers can modify classrooms
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only controllers can modify classrooms")
+
+    # Build dynamic SET clause only for provided fields
+    set_clauses = []
+    params = {"cid": classroom_id}
+
+    # Helper to normalize empty strings to NULL (optional; keeps DB tidy)
+    def _norm(v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v if v != "" else None
+
+    if body.course is not None:
+        set_clauses.append("course = :course")
+        params["course"] = _norm(body.course)
+
+    if body.group is not None:
+        # "group" is reserved; keep it quoted in SQL
+        set_clauses.append("\"group\" = :grp")
+        params["grp"] = _norm(body.group)
+
+    if body.subject is not None:
+        set_clauses.append("subject = :subject")
+        params["subject"] = _norm(body.subject)
+
+    if not set_clauses:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    with engine.begin() as conn:
+        # If caller is a teacher, ensure the classroom belongs to them
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(status_code=404, detail="Classroom not found for this teacher")
+
+        # Execute the update
+        upd_sql = f"""
+            UPDATE numbux.classroom
+               SET {', '.join(set_clauses)},
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_classroom = :cid
+        """
+        res = conn.execute(text(upd_sql), params)
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Classroom not found")
+
+        # Return the updated record (align with TeacherClassroom DTO)
+        row = conn.execute(text("""
+            SELECT c.id_classroom,
+                   c.status,
+                   c.start_date::text AS start_date,
+                   c.end_date::text   AS end_date,
+                   COALESCE(c.student_count, 0) AS students_count,
+                   c.course,
+                   c."group" AS "group",
+                   c.subject
+            FROM numbux.classroom c
+            WHERE c.id_classroom = :cid
+        """), {"cid": classroom_id}).mappings().first()
+
+    return dict(row)
+
+
+
 SQL_TEACHER_CLASSROOM = text("""
     SELECT c.id_classroom,
            c.status,
