@@ -16,7 +16,7 @@ from google.auth.transport.requests import Request as GAuthRequest
 from typing import List, Optional, Literal
 import secrets, base64
 import logging
-
+from typing import Optional
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -916,9 +916,13 @@ from typing import List
 class StudentInClass(BaseModel):
     id_student: int
     full_name: str
-    code: str                  # we'll expose id_student as string here
+    code: str
     is_locked: bool | None = None
-    want_lock: str | None = None  # 'LOCK' | 'UNLOCK' | None
+    want_lock: str | None = None
+    # NEW fields to prefill the edit dialog
+    first_name: str | None = None
+    first_last_name: str | None = None
+    second_last_name: str | None = None
 
 @app.get("/api/teacher/classrooms/{classroom_id}/students", response_model=List[StudentInClass])
 def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)):
@@ -951,7 +955,10 @@ def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)
         ) AS full_name,
         s.id_student::text AS code,
         sc.is_locked,
-        sc.want_lock
+        sc.want_lock,
+        s.first_name,
+        s.first_last_name,
+        s.second_last_name
     FROM numbux.student_classroom sc
     JOIN numbux.student s ON s.id_student = sc.id_student
     WHERE sc.id_classroom = :cid
@@ -1254,6 +1261,102 @@ def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, u
         )
 
     return {"ok": True, "student_id": student_id, "action": action}
+
+# === Teacher/Admin -> update a student's name fields (partial) ===
+class StudentUpdate(BaseModel):
+    # Accept partial updates; None => no change
+    first_name: Optional[str] = None
+    first_last_name: Optional[str] = None
+    second_last_name: Optional[str] = None
+
+class StudentUpdatedOut(BaseModel):
+    id_student: int
+    first_name: Optional[str] = None
+    first_last_name: Optional[str] = None
+    second_last_name: Optional[str] = None
+    # optional helper for display, keep consistent with your list query
+    full_name: Optional[str] = None
+
+@app.patch("/api/teacher/students/{student_id}", response_model=StudentUpdatedOut)
+def update_student_partial(student_id: int, body: StudentUpdate, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only controllers can modify students")
+
+    set_clauses = []
+    params = {"sid": student_id}
+
+    def _norm(v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v if v != "" else None  # "" -> None
+
+    # helper to add only when normalized value is present
+    def _maybe_add(field: str, column: str, value: Optional[str]):
+        norm = _norm(value)
+        if value is None:
+            return  # field not sent -> no change
+        if norm is None:
+            return  # blank string -> treat as no change (avoid NOT NULL issues)
+        set_clauses.append(f"{column} = :{field}")
+        params[field] = norm
+
+    _maybe_add("first_name",       "first_name",       body.first_name)
+    _maybe_add("first_last_name",  "first_last_name",  body.first_last_name)
+    _maybe_add("second_last_name", "second_last_name", body.second_last_name)
+
+    if not set_clauses:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    try:
+        with engine.begin() as conn:
+            if user["role"] == "teacher":
+                own = conn.execute(text("""
+                    SELECT 1
+                      FROM numbux.student_classroom sc
+                      JOIN numbux.teacher_classroom tc
+                        ON tc.id_classroom = sc.id_classroom
+                     WHERE tc.id_teacher = :tid
+                       AND sc.id_student  = :sid
+                     LIMIT 1
+                """), {"tid": user["user_id"], "sid": student_id}).first()
+                if not own:
+                    raise HTTPException(status_code=404, detail="Student not found in your classrooms")
+
+            upd_sql = f"""
+                UPDATE numbux.student
+                   SET {', '.join(set_clauses)},
+                       updated_at = (now() AT TIME ZONE 'utc')
+                 WHERE id_student = :sid
+            """
+            res = conn.execute(text(upd_sql), params)
+            if res.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Student not found")
+
+            row = conn.execute(text("""
+                SELECT
+                    id_student,
+                    first_name,
+                    first_last_name,
+                    second_last_name,
+                    CONCAT_WS(
+                        ', ',
+                        NULLIF(CONCAT_WS(' ',
+                            NULLIF(first_last_name, ''),
+                            NULLIF(second_last_name, '')
+                        ), ''),
+                        NULLIF(first_name, '')
+                    ) AS full_name
+                FROM numbux.student
+                WHERE id_student = :sid
+            """), {"sid": student_id}).mappings().first()
+
+        return dict(row)
+    except IntegrityError as e:
+        # Return a clean 400 instead of 500 if constraints fail
+        raise HTTPException(status_code=400, detail=f"Invalid value: {str(e.orig)[:200]}")
+    except SQLAlchemyError:
+        raise HTTPException(status_code=500, detail="Database error")
 
 # ======= SignUp models =======
 class BaseSignup(BaseModel):
