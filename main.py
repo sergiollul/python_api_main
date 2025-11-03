@@ -2,7 +2,7 @@
 import os
 import sys
 from datetime import datetime, timedelta, timezone, date
-from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect 
+from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, text
@@ -578,6 +578,35 @@ def update_classroom(classroom_id: int, body: ClassroomUpdate, user=Depends(get_
 
     return dict(row)
 
+@app.delete("/api/teacher/classrooms/{classroom_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_classroom(classroom_id: int, user=Depends(get_current_user)):
+    # Only controllers can delete classrooms
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only controllers can delete classrooms")
+
+    with engine.begin() as conn:
+        # For teachers, verify ownership first
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(status_code=404, detail="Classroom not found for this teacher")
+
+        # Delete parent row; ON DELETE CASCADE will remove dependents
+        res = conn.execute(text("""
+            DELETE FROM numbux.classroom
+             WHERE id_classroom = :cid
+        """), {"cid": classroom_id})
+
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Classroom not found")
+
+    # 204 => no body
+    return
 
 
 SQL_TEACHER_CLASSROOM = text("""
