@@ -1433,6 +1433,7 @@ class StudentSignup(BaseSignup):
     platform: str | None = None  # 'Android' | 'iOS' | 'Web'
     device_id: str | None = None
     push_token: str | None = None
+    second_last_name: str | None = None
 
 class TeacherSignup(BaseSignup):
     pass
@@ -1535,23 +1536,30 @@ def signup_student(body: StudentSignup):
         id_ec = _claim_license_and_get_center(conn, body.license_code, email_lower, body.id_ec)
 
         insert_student = text("""
-            INSERT INTO numbux.student (first_name, first_last_name, email, phone, password_hash, device_id, push_token, platform)
-            VALUES (:first_name, :first_last_name, :email, :phone, :password_hash, :device_id, :push_token, :platform)
+            INSERT INTO numbux.student
+                (first_name, first_last_name, second_last_name, email, phone, password_hash, device_id, push_token, platform)
+            VALUES
+                (:first_name, :first_last_name, :second_last_name, :email, :phone, :password_hash, :device_id, :push_token, :platform)
             RETURNING id_student
         """)
+
+
         student_id = conn.execute(
             insert_student,
             {
                 "first_name": body.first_name,
-                "first_last_name": body.last_name,
+                "first_last_name": body.last_name,                 # maps to first_last_name
+                "second_last_name": body.second_last_name,         # NEW
                 "email": email_lower,
-                "phone": body.phone,
+                "phone": body.phone,                               # keep nullable
                 "password_hash": _hash_password(body.password),
                 "device_id": body.device_id,
                 "push_token": body.push_token,
                 "platform": body.platform,
             }
         ).scalar_one()
+
+
 
         insert_students_ec = text("""
             INSERT INTO numbux.student_ec (id_ec, id_student, academic_year, start_date, end_date, status, license_code, role)
