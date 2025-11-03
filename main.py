@@ -1262,6 +1262,66 @@ def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, u
 
     return {"ok": True, "student_id": student_id, "action": action}
 
+
+# --- Remove a student from a classroom ---
+@app.delete("/api/teacher/classrooms/{classroom_id}/students/{student_id}", status_code=204)
+def remove_student_from_classroom(classroom_id: int, student_id: int, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only controllers can remove students")
+
+    with engine.begin() as conn:
+        # If teacher → ensure class ownership
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(status_code=404, detail="Classroom not found for this teacher")
+
+        # Ensure the student is enrolled in this classroom
+        enrolled = conn.execute(text("""
+            SELECT 1
+              FROM numbux.student_classroom
+             WHERE id_classroom = :cid AND id_student = :sid
+             LIMIT 1
+        """), {"cid": classroom_id, "sid": student_id}).first()
+        if not enrolled:
+            raise HTTPException(status_code=404, detail="Student not in this classroom")
+
+        # Remove enrollment
+        res = conn.execute(text("""
+            DELETE FROM numbux.student_classroom
+             WHERE id_classroom = :cid AND id_student = :sid
+        """), {"cid": classroom_id, "sid": student_id})
+
+        # Recalculate student_count to keep it accurate
+        conn.execute(text("""
+            UPDATE numbux.classroom
+               SET student_count = (
+                       SELECT COUNT(*) FROM numbux.student_classroom
+                        WHERE id_classroom = :cid
+                   ),
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_classroom = :cid
+        """), {"cid": classroom_id})
+
+    # Optional: notify live sockets the student list changed
+    try:
+        broadcast_to_classrooms([classroom_id], {
+            "type": "student_removed",
+            "student_id": student_id,
+            "classroom_id": classroom_id,
+            "ts": _now_utc().isoformat()
+        })
+    except Exception:
+        pass
+
+    return
+
+
 # === Teacher/Admin -> update a student's name fields (partial) ===
 class StudentUpdate(BaseModel):
     # Accept partial updates; None => no change
