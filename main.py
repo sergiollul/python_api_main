@@ -1129,6 +1129,45 @@ def student_my_classrooms(user=Depends(get_current_user)):
     return [dict(r) for r in rows]
 
 
+# === Student -> verify sign-out PIN (one-time, clears on success) ===
+class PinVerifyRequest(BaseModel):
+    pin: str
+
+class PinVerifyResponse(BaseModel):
+    ok: bool
+
+@app.post("/api/student/pin/verify", response_model=PinVerifyResponse)
+def verify_signout_pin(body: PinVerifyRequest, user=Depends(get_current_user)):
+    if user["role"] != "student":
+        raise HTTPException(status_code=403, detail="Only students can verify PINs")
+
+    pin = (body.pin or "").strip()
+    if not (len(pin) == 6 and pin.isdigit()):
+        raise HTTPException(status_code=400, detail="PIN must be 6 digits")
+
+    now_utc = _now_utc()
+
+    # Atomic check+clear to prevent reuse/races
+    with engine.begin() as conn:
+        res = conn.execute(text("""
+            UPDATE numbux.student
+               SET pin_signout = NULL,
+                   pin_signout_expires_at = NULL,
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_student = :sid
+               AND pin_signout = :pin
+               AND pin_signout_expires_at IS NOT NULL
+               AND pin_signout_expires_at >= :now
+        """), {"sid": user["user_id"], "pin": pin, "now": now_utc})
+
+        if res.rowcount == 1:
+            return PinVerifyResponse(ok=True)
+
+    # Generic error to avoid leaking details
+    raise HTTPException(status_code=401, detail="Invalid or expired PIN")
+
+
+
 @app.get("/me")
 def me(user=Depends(get_current_user)):
     return user
