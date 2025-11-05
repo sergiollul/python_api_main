@@ -1223,6 +1223,27 @@ def admin_logout(body: LogoutRequest = None, user=Depends(get_current_user)):
     return LogoutResponse(ok=True)
 
 
+# === Teacher logout (stateless; client must delete tokens) ===
+@app.post("/api/teacher/logout", response_model=LogoutResponse)
+def teacher_logout(body: LogoutRequest = None, user=Depends(get_current_user)):
+    if user["role"] != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can log out via this endpoint")
+
+    # Optional: if a refresh token is supplied, validate it matches this teacher and is indeed a refresh token
+    if body and body.refresh_token:
+        try:
+            payload = jwt.decode(body.refresh_token, REFRESH_SECRET, algorithms=[JWT_ALGORITHM])
+            if payload.get("typ") != "refresh":
+                raise HTTPException(status_code=400, detail="Provided token is not a refresh token")
+            if str(payload.get("sub")) != str(user["user_id"]) or payload.get("role") != "teacher":
+                raise HTTPException(status_code=401, detail="Invalid refresh token for this teacher")
+        except JWTError:
+            # Invalid/expired refresh token – still tell client to clear tokens
+            pass
+
+    # Stateless logout: the frontend must delete access_token and refresh_token locally.
+    return LogoutResponse(ok=True)
+
 
 # === MDM minimal endpoints (device token, desired state, ack) ===
 mdm_router = APIRouter()
