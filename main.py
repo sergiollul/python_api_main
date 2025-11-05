@@ -626,6 +626,29 @@ SQL_TEACHER_CLASSROOM = text("""
     ORDER BY c.id_classroom DESC
 """)
 
+SQL_ADMIN_CENTER_CLASSROOMS = text("""
+    SELECT DISTINCT
+           c.id_classroom,
+           c.status,
+           c.start_date::text AS start_date,
+           c.end_date::text   AS end_date,
+           COALESCE(c.student_count, 0) AS students_count,
+           c.course,
+           c."group" AS "group",
+           c.subject,
+           c.allow_join_student,
+           c.join_token_expires_at::text AS join_token_expires_at
+      FROM numbux.classroom c
+      JOIN numbux.teacher_classroom tc
+        ON tc.id_classroom = c.id_classroom
+      JOIN numbux.teacher_ec te
+        ON te.id_teacher = tc.id_teacher
+       AND (te.status ILIKE 'active' OR te.status IS NULL)
+     WHERE te.id_ec = :id_ec
+  ORDER BY c.id_classroom DESC
+""")
+
+
 # === Live websocket for teacher updates (place AFTER SQL_TEACHER_CLASSROOM) ===
 @app.websocket("/api/teacher/live")
 async def teacher_live(ws: WebSocket):
@@ -909,6 +932,48 @@ def my_teacher_classrooms(user=Depends(get_current_user)):
 
     # Pydantic will serialize date fields automatically
     return [dict(r) for r in rows]
+
+
+@app.get("/api/admin/classrooms", response_model=list[TeacherClassroom])
+def admin_center_classrooms(
+    id_ec: Optional[int] = Query(None, description="Educational center ID (required for admin_numbux)"),
+    user=Depends(get_current_user)
+):
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can list center classrooms")
+
+    with engine.connect() as conn:
+        if user["role"] == "admin_ec":
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+            admin_ec_id = int(row["id_ec"])
+
+            if id_ec is not None and int(id_ec) != admin_ec_id:
+                raise HTTPException(status_code=403, detail="Cannot query another educational center")
+            id_ec = admin_ec_id
+
+        elif user["role"] == "admin_numbux":
+            if id_ec is None:
+                raise HTTPException(status_code=400, detail="id_ec is required for platform admins")
+
+        try:
+            rows = conn.execute(SQL_ADMIN_CENTER_CLASSROOMS, {"id_ec": int(id_ec)}).mappings().all()
+        except ProgrammingError:
+            raise HTTPException(status_code=500, detail="Database query failed")
+
+    return [dict(r) for r in rows]
+
+
+
+
 
 # === Teacher -> list students in a classroom ===
 from typing import List
