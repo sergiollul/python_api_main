@@ -1064,7 +1064,6 @@ def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)
         rows = conn.execute(text("""
             SELECT
                 s.id_student,
-                /* Build: "<first_last_name> <second_last_name>, <first_name>" */
                 CONCAT_WS(
                     ', ',
                     NULLIF(CONCAT_WS(' ',
@@ -1074,8 +1073,8 @@ def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)
                     NULLIF(s.first_name, '')
                 ) AS full_name,
                 s.id_student::text AS code,
-                sc.is_locked,
-                sc.want_lock,
+                s.is_locked,        -- GLOBAL
+                s.want_lock,        -- GLOBAL
                 COALESCE(s.first_name, '') AS first_name,
                 COALESCE(s.first_last_name, '') AS first_last_name,
                 COALESCE(s.second_last_name, '') AS second_last_name
@@ -1275,34 +1274,49 @@ def desired_state(user=Depends(get_current_user)):
 
     with engine.connect() as conn:
         row = conn.execute(text("""
-            WITH candidates AS (
-                SELECT id_classroom, want_lock, is_locked, updated_at
+            WITH sc AS (
+                SELECT want_lock, is_locked, updated_at
                   FROM numbux.student_classroom
                  WHERE id_student = :sid
             ),
-            pending AS (
-                SELECT *
-                  FROM candidates
+            latest_sc AS (
+                SELECT want_lock, is_locked, updated_at
+                  FROM sc
+                 ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
+                 LIMIT 1
+            ),
+            pending_sc AS (
+                SELECT want_lock
+                  FROM sc
                  WHERE want_lock IS NOT NULL
                  ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
                  LIMIT 1
+            ),
+            g AS (
+                SELECT want_lock AS g_want_lock
+                  FROM numbux.student
+                 WHERE id_student = :sid
+                 LIMIT 1
             )
             SELECT
-                COALESCE((SELECT want_lock FROM pending),
-                         NULL)               AS want_lock,
-                (SELECT is_locked FROM candidates
-                  ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
-                  LIMIT 1)                  AS is_locked
+                -- Prefer global want_lock (student), else latest per-class pending, else NULL
+                COALESCE(
+                    (SELECT g_want_lock FROM g),
+                    (SELECT want_lock FROM pending_sc),
+                    NULL
+                ) AS want_lock,
+                -- Report most recent observed lock state from any classroom row
+                (SELECT is_locked FROM latest_sc) AS is_locked
         """), {"sid": user["user_id"]}).mappings().first()
 
-    # if the student has no rows at all
     if not row:
         return {"want_lock": None, "is_locked": None}
 
     return {
-        "want_lock": row["want_lock"],     # "LOCK" | "UNLOCK" | None
-        "is_locked": row["is_locked"],     # bool | None
+        "want_lock": row["want_lock"],   # "LOCK" | "UNLOCK" | None
+        "is_locked": row["is_locked"],   # bool | None
     }
+
 
 class AckBody(BaseModel):
     result: str   # "LOCKED" | "UNLOCKED" | "ERROR"
@@ -1313,29 +1327,25 @@ def lock_ack(body: AckBody, user=Depends(get_current_user)):
     if user["role"] != "student":
         raise HTTPException(403, "Only students ACK")
 
-    is_locked = None
-    if body.result == "LOCKED":
-        is_locked = True
-    elif body.result == "UNLOCKED":
-        is_locked = False
-    elif body.result != "ERROR":
+    if body.result not in {"LOCKED","UNLOCKED","ERROR"}:
         raise HTTPException(400, "result must be LOCKED | UNLOCKED | ERROR")
+
+    is_locked = True if body.result == "LOCKED" else False if body.result == "UNLOCKED" else None
 
     with engine.begin() as conn:
         conn.execute(text("""
-            UPDATE numbux.student_classroom
-               SET want_lock = NULL,
+            UPDATE numbux.student
+               SET want_lock = CASE WHEN :is_locked IS NOT NULL THEN NULL ELSE want_lock END,
                    is_locked = COALESCE(:is_locked, is_locked),
                    updated_at = (now() AT TIME ZONE 'utc')
              WHERE id_student = :sid
-               AND want_lock IS NOT NULL
         """), {"is_locked": is_locked, "sid": user["user_id"]})
 
-    # If we actually changed lock state, tell teachers
     if is_locked is not None:
         broadcast_student_toggle(student_id=user["user_id"], is_locked=is_locked)
 
     return {"ok": True}
+
 
 
 
@@ -1346,16 +1356,15 @@ def device_toggle_report(body: ToggleReport, user=Depends(get_current_user)):
 
     with engine.begin() as conn:
         conn.execute(text("""
-            UPDATE numbux.student_classroom
+            UPDATE numbux.student
                SET is_locked = :locked,
                    updated_at = (now() AT TIME ZONE 'utc')
              WHERE id_student = :sid
         """), {"locked": body.is_locked, "sid": user["user_id"]})
 
-    # live broadcast to all teacher sockets for this student
     broadcast_student_toggle(student_id=user["user_id"], is_locked=body.is_locked)
-
     return {"ok": True}
+
 
 
 
@@ -1369,6 +1378,7 @@ from typing import List
 class OrderBody(BaseModel):
     action: str  # "LOCK" | "UNLOCK"
 
+
 @app.post("/api/teacher/classrooms/{classroom_id}/order")
 def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_current_user)):
     if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
@@ -1381,10 +1391,25 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
     now_iso = _now_utc().isoformat()
 
     with engine.begin() as conn:
+        # Ensure the teacher owns the classroom (if role == teacher)
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_classroom
+                 WHERE id_teacher = :tid AND id_classroom = :cid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "cid": classroom_id}).first()
+            if not own:
+                raise HTTPException(404, "Classroom not found for this teacher")
+
+        # === Your block goes here (sets global student.want_lock for the class) ===
         conn.execute(text("""
-            UPDATE numbux.student_classroom
-               SET want_lock = :w, updated_at = (now() AT TIME ZONE 'utc')
-             WHERE id_classroom = :cid
+            UPDATE numbux.student s
+               SET want_lock = :w,
+                   updated_at = (now() AT TIME ZONE 'utc')
+              FROM numbux.student_classroom sc
+             WHERE sc.id_classroom = :cid
+               AND sc.id_student = s.id_student
         """), {"w": action, "cid": classroom_id})
 
         rows = conn.execute(text("""
@@ -1395,6 +1420,7 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
              WHERE sc.id_classroom = :cid
         """), {"cid": classroom_id}).mappings().all()
 
+    # Fan out the FCM order to every device in the class
     notified = 0
     for r in rows:
         sid = r["id_student"]
@@ -1405,17 +1431,63 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
             token=tok,
             data={
                 "type": "LOCK_ORDER",
-                "action": action,                 # "LOCK" | "UNLOCK"
+                "action": action,
                 "student_id": sid,
                 "classroom_id": classroom_id,
                 "ts": now_iso,
             },
-            collapse_key="lock_order",            # optional; helps dedupe
-            ttl_seconds=300                       # ✅ queue up to ~5 minutes instead of drop
+            collapse_key="lock_order",
+            ttl_seconds=300
         )
-        if ok: notified += 1
+        if ok:
+            notified += 1
 
-    return {"ok": True, "notified": notified}
+    return {"ok": True, "classroom_id": classroom_id, "action": action, "notified": notified}
+
+
+@app.post("/api/teacher/students/{student_id}/order")
+def teacher_order_student_global(student_id: int, body: OrderBody, user=Depends(get_current_user)):
+    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+        raise HTTPException(403, "Only controllers can order lock/unlock")
+
+    action = (body.action or "").upper()
+    if action not in {"LOCK", "UNLOCK"}:
+        raise HTTPException(400, "action must be LOCK or UNLOCK")
+
+    with engine.begin() as conn:
+        # Seguridad: si es teacher, debe tener a este alumno en alguna de sus clases
+        if user["role"] == "teacher":
+            own = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.student_classroom sc
+                  JOIN numbux.teacher_classroom tc
+                    ON tc.id_classroom = sc.id_classroom
+                 WHERE tc.id_teacher = :tid
+                   AND sc.id_student  = :sid
+                 LIMIT 1
+            """), {"tid": user["user_id"], "sid": student_id}).first()
+            if not own:
+                raise HTTPException(404, "Student not found in your classrooms")
+
+        conn.execute(text("""
+            UPDATE numbux.student
+               SET want_lock = :w,
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_student = :sid
+        """), {"w": action, "sid": student_id})
+
+        tok = conn.execute(text("""
+            SELECT push_token FROM numbux.student WHERE id_student = :sid
+        """), {"sid": student_id}).scalar()
+
+    if tok:
+        send_fcm(
+            token=tok,
+            data={"type": "LOCK_ORDER", "action": action, "student_id": student_id},
+            collapse_key="lock_order", ttl_seconds=300
+        )
+
+    return {"ok": True, "student_id": student_id, "action": action}
 
 @app.post("/api/teacher/classrooms/{classroom_id}/students/{student_id}/order")
 def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, user=Depends(get_current_user)):
@@ -1447,11 +1519,11 @@ def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, u
             raise HTTPException(404, "Student not in this classroom")
 
         conn.execute(text("""
-            UPDATE numbux.student_classroom
-               SET want_lock = :w, updated_at = (now() AT TIME ZONE 'utc')
-             WHERE id_classroom = :cid
-               AND id_student   = :sid
-        """), {"w": action, "cid": classroom_id, "sid": student_id})
+            UPDATE numbux.student
+            SET want_lock = :w,
+                updated_at = (now() AT TIME ZONE 'utc')
+            WHERE id_student = :sid
+        """), {"w": action, "sid": student_id})
 
         tok = conn.execute(text("""
             SELECT push_token
