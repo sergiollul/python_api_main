@@ -972,6 +972,61 @@ def admin_center_classrooms(
     return [dict(r) for r in rows]
 
 
+# === Admin EC -> create a 6-digit sign-out PIN for a student (valid 10 minutes) ===
+class SignoutPinResponse(BaseModel):
+    student_id: int
+    pin: str
+    expires_at: datetime
+
+@app.post("/api/admin/students/{student_id}/signout-pin", response_model=SignoutPinResponse)
+def create_signout_pin(student_id: int, user=Depends(get_current_user)):
+    # Only admin_ec can mint sign-out PINs
+    if user["role"] != "admin_ec":
+        raise HTTPException(status_code=403, detail="Only admin_ec can create sign-out PINs")
+
+    expires_at = _now_utc() + timedelta(minutes=10)
+    pin = f"{secrets.randbelow(1_000_000):06d}"  # zero-padded 6-digit
+
+    with engine.begin() as conn:
+        # 1) Admin's active educational center
+        admin_ec_row = conn.execute(text("""
+            SELECT id_ec
+              FROM numbux.admin_ec_ec
+             WHERE id_admin = :aid
+               AND (status ILIKE 'active' OR status IS NULL)
+             ORDER BY start_date DESC NULLS LAST
+             LIMIT 1
+        """), {"aid": user["user_id"]}).mappings().first()
+        if not admin_ec_row:
+            raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+        id_ec = int(admin_ec_row["id_ec"])
+
+        # 2) Student must belong to this center (active)
+        stu_ok = conn.execute(text("""
+            SELECT 1
+              FROM numbux.student_ec
+             WHERE id_student = :sid
+               AND id_ec = :id_ec
+               AND (status ILIKE 'active' OR status IS NULL)
+             LIMIT 1
+        """), {"sid": student_id, "id_ec": id_ec}).first()
+        if not stu_ok:
+            raise HTTPException(status_code=404, detail="Student not found in your educational center")
+
+        # 3) Store PIN + expiry on student
+        res = conn.execute(text("""
+            UPDATE numbux.student
+               SET pin_signout = :pin,
+                   pin_signout_expires_at = :exp,
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_student = :sid
+        """), {"pin": pin, "exp": expires_at, "sid": student_id})
+
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Student not found")
+
+    return SignoutPinResponse(student_id=student_id, pin=pin, expires_at=expires_at)
 
 
 
