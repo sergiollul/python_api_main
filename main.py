@@ -1189,6 +1189,39 @@ def refresh(body: RefreshRequest):
 
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    
+
+# === Admin logout (stateless; client must delete tokens) ===
+class LogoutRequest(BaseModel):
+    # Optional: if the client sends its refresh token, we verify it matches this admin.
+    refresh_token: Optional[str] = None
+
+class LogoutResponse(BaseModel):
+    ok: bool
+
+@app.post("/api/admin/logout", response_model=LogoutResponse)
+def admin_logout(body: LogoutRequest = None, user=Depends(get_current_user)):
+    # Only admin_ec can use this endpoint
+    if user["role"] != "admin_ec":
+        raise HTTPException(status_code=403, detail="Only admin_ec can log out via this endpoint")
+
+    # If a refresh token is supplied, validate it belongs to the same admin and is a refresh token
+    if body and body.refresh_token:
+        try:
+            payload = jwt.decode(body.refresh_token, REFRESH_SECRET, algorithms=[JWT_ALGORITHM])
+            if payload.get("typ") != "refresh":
+                raise HTTPException(status_code=400, detail="Provided token is not a refresh token")
+            if str(payload.get("sub")) != str(user["user_id"]) or payload.get("role") != "admin_ec":
+                # Don't leak details: just reject
+                raise HTTPException(status_code=401, detail="Invalid refresh token for this admin")
+        except JWTError:
+            # Invalid/expired refresh token – treat as logout anyway but signal client side to clear tokens
+            pass
+
+    # Stateless logout: nothing to revoke server-side (JWTs are self-contained).
+    # The frontend must delete both access_token and refresh_token.
+    return LogoutResponse(ok=True)
+
 
 
 # === MDM minimal endpoints (device token, desired state, ack) ===
