@@ -1274,39 +1274,10 @@ def desired_state(user=Depends(get_current_user)):
 
     with engine.connect() as conn:
         row = conn.execute(text("""
-            WITH sc AS (
-                SELECT want_lock, is_locked, updated_at
-                  FROM numbux.student_classroom
-                 WHERE id_student = :sid
-            ),
-            latest_sc AS (
-                SELECT want_lock, is_locked, updated_at
-                  FROM sc
-                 ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
-                 LIMIT 1
-            ),
-            pending_sc AS (
-                SELECT want_lock
-                  FROM sc
-                 WHERE want_lock IS NOT NULL
-                 ORDER BY COALESCE(updated_at, now() AT TIME ZONE 'utc') DESC
-                 LIMIT 1
-            ),
-            g AS (
-                SELECT want_lock AS g_want_lock
-                  FROM numbux.student
-                 WHERE id_student = :sid
-                 LIMIT 1
-            )
-            SELECT
-                -- Prefer global want_lock (student), else latest per-class pending, else NULL
-                COALESCE(
-                    (SELECT g_want_lock FROM g),
-                    (SELECT want_lock FROM pending_sc),
-                    NULL
-                ) AS want_lock,
-                -- Report most recent observed lock state from any classroom row
-                (SELECT is_locked FROM latest_sc) AS is_locked
+            SELECT want_lock, is_locked
+              FROM numbux.student
+             WHERE id_student = :sid
+             LIMIT 1
         """), {"sid": user["user_id"]}).mappings().first()
 
     if not row:
@@ -1316,6 +1287,7 @@ def desired_state(user=Depends(get_current_user)):
         "want_lock": row["want_lock"],   # "LOCK" | "UNLOCK" | None
         "is_locked": row["is_locked"],   # bool | None
     }
+
 
 
 class AckBody(BaseModel):
