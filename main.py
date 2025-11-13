@@ -1718,6 +1718,14 @@ class AdminCreateTeacher(BaseModel):
     # For admin_numbux; admin_ec will default to their own center
     id_ec: Optional[int] = None
 
+class AdminUpdateTeacher(BaseModel):
+    # Accept partial updates; None => no change
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+
 
 @app.get("/api/admin/center-students", response_model=list[AdminStudentWithStatusOut])
 def admin_list_center_students(
@@ -1950,6 +1958,148 @@ def admin_create_teacher(body: AdminCreateTeacher, user=Depends(get_current_user
             FROM numbux.teacher t
             WHERE t.id_teacher = :tid
         """), {"tid": teacher_id, "id_ec": id_ec}).mappings().first()
+
+    return AdminTeacherOut(**row)
+
+
+@app.patch("/api/admin/teachers/{teacher_id}", response_model=AdminTeacherOut)
+def admin_update_teacher(teacher_id: int, body: AdminUpdateTeacher, user=Depends(get_current_user)):
+    """
+    Edit a teacher's basic data (name, email, phone).
+
+    - admin_ec: can only edit teachers that belong to their active educational center.
+    - admin_numbux: can edit any teacher (but teacher must be linked to some center).
+    """
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can edit teachers")
+
+    # Helper to normalize strings; treat blank "" as "no change"
+    def _norm(v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v if v != "" else None
+
+    # helper to add only when normalized value is present
+    def _maybe_add(field: str, column: str, value: Optional[str],
+                   set_clauses: list[str], params: dict):
+        if value is None:
+            return  # field not sent -> no change
+        norm = _norm(value)
+        if norm is None:
+            return  # blank string -> treat as no change
+        set_clauses.append(f"{column} = :{field}")
+        params[field] = norm
+
+    with engine.begin() as conn:
+        # --- Ensure teacher exists and get current email ---
+        teacher_row = conn.execute(text("""
+            SELECT email
+              FROM numbux.teacher
+             WHERE id_teacher = :tid
+        """), {"tid": teacher_id}).mappings().first()
+
+        if not teacher_row:
+            raise HTTPException(status_code=404, detail="Teacher not found")
+
+        current_email_lower = (teacher_row["email"] or "").lower()
+
+        # --- Resolve educational center and enforce scope ---
+        if user["role"] == "admin_ec":
+            admin_ec_row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+
+            if not admin_ec_row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            resolved_id_ec = int(admin_ec_row["id_ec"])
+
+            # Teacher must belong (active) to this center
+            teacher_ok = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_ec
+                 WHERE id_teacher = :tid
+                   AND id_ec      = :id_ec
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 LIMIT 1
+            """), {"tid": teacher_id, "id_ec": resolved_id_ec}).first()
+
+            if not teacher_ok:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Teacher not found in your educational center"
+                )
+        else:
+            # admin_numbux: find any active center for this teacher for the response
+            ec_row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.teacher_ec
+                 WHERE id_teacher = :tid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"tid": teacher_id}).mappings().first()
+
+            if not ec_row:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Teacher is not assigned to any educational center"
+                )
+
+            resolved_id_ec = int(ec_row["id_ec"])
+
+        # --- Build dynamic UPDATE ---
+        set_clauses: list[str] = []
+        params: dict = {"tid": teacher_id}
+
+        _maybe_add("first_name", "first_name", body.first_name, set_clauses, params)
+        _maybe_add("last_name",  "last_name",  body.last_name,  set_clauses, params)
+        _maybe_add("phone",      "phone",      body.phone,      set_clauses, params)
+
+        # Email change (check uniqueness across all users)
+        if body.email is not None:
+            new_email_lower = body.email.lower().strip()
+            if new_email_lower and new_email_lower != current_email_lower:
+                _ensure_email_not_exists(conn, new_email_lower)
+                set_clauses.append("email = :email")
+                params["email"] = new_email_lower
+
+        if not set_clauses:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        upd_sql = f"""
+            UPDATE numbux.teacher
+               SET {', '.join(set_clauses)},
+                   updated_at = (now() AT TIME ZONE 'utc')
+             WHERE id_teacher = :tid
+        """
+        res = conn.execute(text(upd_sql), params)
+        if res.rowcount == 0:
+            # Very unlikely here (we already checked existence) but keep it consistent
+            raise HTTPException(status_code=404, detail="Teacher not found")
+
+        # --- Read back normalized view for response ---
+        row = conn.execute(text("""
+            SELECT
+                t.id_teacher,
+                COALESCE(t.first_name, '') AS first_name,
+                COALESCE(t.last_name, '')  AS last_name,
+                t.email,
+                :id_ec                     AS id_ec,
+                CONCAT_WS(
+                    ', ',
+                    NULLIF(t.last_name, ''),
+                    NULLIF(t.first_name, '')
+                ) AS full_name
+            FROM numbux.teacher t
+            WHERE t.id_teacher = :tid
+        """), {"tid": teacher_id, "id_ec": resolved_id_ec}).mappings().first()
 
     return AdminTeacherOut(**row)
 
