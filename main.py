@@ -1709,6 +1709,15 @@ class AdminTeacherOut(BaseModel):
     email: EmailStr
     id_ec: int
 
+class AdminCreateTeacher(BaseModel):
+    first_name: str
+    last_name: Optional[str] = None
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+    # For admin_numbux; admin_ec will default to their own center
+    id_ec: Optional[int] = None
+
 
 @app.get("/api/admin/center-students", response_model=list[AdminStudentWithStatusOut])
 def admin_list_center_students(
@@ -1847,6 +1856,102 @@ def admin_list_center_teachers(
         )
         for row in rows
     ]
+
+@app.post("/api/admin/teachers", response_model=AdminTeacherOut)
+def admin_create_teacher(body: AdminCreateTeacher, user=Depends(get_current_user)):
+    # Only admins can create teachers
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can create teachers")
+
+    email_lower = body.email.lower()
+
+    with engine.begin() as conn:
+        # 1) Ensure email is not already used by any user type
+        _ensure_email_not_exists(conn, email_lower)
+
+        # 2) Resolve educational center depending on admin role
+        if user["role"] == "admin_ec":
+            # Admin EC: must belong to exactly one active center
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            admin_ec_id = int(row["id_ec"])
+
+            # If body.id_ec is present, enforce it matches
+            if body.id_ec is not None and int(body.id_ec) != admin_ec_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot create teachers in another educational center"
+                )
+
+            id_ec = admin_ec_id
+
+        else:  # admin_numbux
+            # Platform admin must explicitly choose the center
+            if body.id_ec is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="id_ec is required for platform admins"
+                )
+            id_ec = int(body.id_ec)
+
+        # 3) Insert into numbux.teacher
+        teacher_id = conn.execute(text("""
+            INSERT INTO numbux.teacher
+                (first_name, last_name, email, phone, password_hash)
+            VALUES
+                (:first_name, :last_name, :email, :phone, :password_hash)
+            RETURNING id_teacher
+        """), {
+            "first_name": body.first_name,
+            "last_name": body.last_name,
+            "email": email_lower,
+            "phone": body.phone,
+            "password_hash": _hash_password(body.password),
+        }).scalar_one()
+
+        # 4) Link teacher to the center in numbux.teacher_ec
+        conn.execute(text("""
+            INSERT INTO numbux.teacher_ec
+                (id_ec, id_teacher, academic_year, start_date, end_date,
+                 status, license_code, role)
+            VALUES
+                (:id_ec, :id_teacher, :academic_year, :start_date, NULL,
+                 'active', NULL, 'teacher')
+        """), {
+            "id_ec": id_ec,
+            "id_teacher": teacher_id,
+            "academic_year": None,
+            "start_date": _today_utc_date(),
+        })
+
+        # 5) Read back a normalized view of the teacher
+        row = conn.execute(text("""
+            SELECT
+                t.id_teacher,
+                COALESCE(t.first_name, '') AS first_name,
+                COALESCE(t.last_name, '')  AS last_name,
+                t.email,
+                :id_ec                     AS id_ec,
+                CONCAT_WS(
+                    ', ',
+                    NULLIF(t.last_name, ''),
+                    NULLIF(t.first_name, '')
+                ) AS full_name
+            FROM numbux.teacher t
+            WHERE t.id_teacher = :tid
+        """), {"tid": teacher_id, "id_ec": id_ec}).mappings().first()
+
+    return AdminTeacherOut(**row)
 
 
 @app.post("/api/admin/students", response_model=AdminStudentOut)
