@@ -1876,6 +1876,69 @@ def admin_create_student(body: AdminCreateStudent, user=Depends(get_current_user
 
     return AdminStudentOut(**row)
 
+@app.delete("/api/admin/students/{student_id}", status_code=204)
+def admin_delete_student(student_id: int, user=Depends(get_current_user)):
+    """
+    Delete a student account.
+
+    - admin_ec: can only delete students that belong to their active educational center.
+    - admin_numbux: can delete any student.
+    """
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can delete students")
+
+    with engine.begin() as conn:
+        # --- Scope check for admin_ec ---
+        if user["role"] == "admin_ec":
+            admin_ec_row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+
+            if not admin_ec_row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            id_ec = int(admin_ec_row["id_ec"])
+
+            # Student must belong (active) to this center
+            stu_ok = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.student_ec
+                 WHERE id_student = :sid
+                   AND id_ec = :id_ec
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 LIMIT 1
+            """), {"sid": student_id, "id_ec": id_ec}).first()
+
+            if not stu_ok:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Student not found in your educational center"
+                )
+
+        # --- Try to delete the student row itself ---
+        try:
+            res = conn.execute(text("""
+                DELETE FROM numbux.student
+                 WHERE id_student = :sid
+            """), {"sid": student_id})
+        except IntegrityError:
+            # Most likely FK references (e.g. not cascaded student_classroom, logs, etc.)
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot delete student: still referenced in other records"
+            )
+
+        if res.rowcount == 0:
+            # For admin_numbux or race conditions
+            raise HTTPException(status_code=404, detail="Student not found")
+
+    # 204 → no body
+    return
 
 # ======= SignUp models =======
 class BaseSignup(BaseModel):
