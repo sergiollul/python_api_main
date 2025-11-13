@@ -2104,6 +2104,71 @@ def admin_update_teacher(teacher_id: int, body: AdminUpdateTeacher, user=Depends
     return AdminTeacherOut(**row)
 
 
+@app.delete("/api/admin/teachers/{teacher_id}", status_code=204)
+def admin_delete_teacher(teacher_id: int, user=Depends(get_current_user)):
+    """
+    Delete a teacher account.
+
+    - admin_ec: can only delete teachers that belong to their active educational center.
+    - admin_numbux: can delete any teacher.
+    """
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can delete teachers")
+
+    with engine.begin() as conn:
+        # --- Scope check for admin_ec ---
+        if user["role"] == "admin_ec":
+            admin_ec_row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+
+            if not admin_ec_row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            id_ec = int(admin_ec_row["id_ec"])
+
+            # Teacher must belong (active) to this center
+            teacher_ok = conn.execute(text("""
+                SELECT 1
+                  FROM numbux.teacher_ec
+                 WHERE id_teacher = :tid
+                   AND id_ec      = :id_ec
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 LIMIT 1
+            """), {"tid": teacher_id, "id_ec": id_ec}).first()
+
+            if not teacher_ok:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Teacher not found in your educational center"
+                )
+
+        # --- Try to delete the teacher row itself ---
+        try:
+            res = conn.execute(text("""
+                DELETE FROM numbux.teacher
+                 WHERE id_teacher = :tid
+            """), {"tid": teacher_id})
+        except IntegrityError:
+            # Most likely FK references (e.g. classrooms, logs, etc.)
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot delete teacher: still referenced in other records"
+            )
+
+        if res.rowcount == 0:
+            # For admin_numbux or race conditions
+            raise HTTPException(status_code=404, detail="Teacher not found")
+
+    # 204 → no body
+    return
+
+
 @app.post("/api/admin/students", response_model=AdminStudentOut)
 def admin_create_student(body: AdminCreateStudent, user=Depends(get_current_user)):
     # Only admins can create students
