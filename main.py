@@ -1675,6 +1675,208 @@ def update_student_partial(student_id: int, body: StudentUpdate, user=Depends(ge
     except SQLAlchemyError:
         raise HTTPException(status_code=500, detail="Database error")
 
+# === Admin -> create a new student account ===
+class AdminCreateStudent(BaseModel):
+    first_name: str
+    first_last_name: Optional[str] = None
+    second_last_name: Optional[str] = None
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+    # For admin_numbux; admin_ec will default to their own center
+    id_ec: Optional[int] = None
+
+
+class AdminStudentOut(BaseModel):
+    id_student: int
+    first_name: Optional[str] = None
+    first_last_name: Optional[str] = None
+    second_last_name: Optional[str] = None
+    full_name: Optional[str] = None
+    email: EmailStr
+    id_ec: int
+
+class AdminStudentWithStatusOut(AdminStudentOut):
+    is_locked: Optional[bool] = None
+    want_lock: Optional[str] = None
+    code: Optional[str] = None
+
+@app.get("/api/admin/center-students", response_model=list[AdminStudentWithStatusOut])
+def admin_list_center_students(
+    id_ec: Optional[int] = Query(None),
+    user = Depends(get_current_user),
+):
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can list students")
+
+    with engine.begin() as conn:
+        if user["role"] == "admin_ec":
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+            resolved_id_ec = int(row["id_ec"])
+        else:
+            if id_ec is None:
+                raise HTTPException(status_code=400, detail="id_ec is required for platform admins")
+            resolved_id_ec = int(id_ec)
+
+        rows = conn.execute(text("""
+            SELECT
+                s.id_student,
+                s.email,
+                COALESCE(s.first_name, '')       AS first_name,
+                COALESCE(s.first_last_name, '')  AS first_last_name,
+                COALESCE(s.second_last_name, '') AS second_last_name,
+                :id_ec                           AS id_ec,
+                CONCAT_WS(
+                    ', ',
+                    NULLIF(CONCAT_WS(' ',
+                        NULLIF(s.first_last_name, ''),
+                        NULLIF(s.second_last_name, '')
+                    ), ''),
+                    NULLIF(s.first_name, '')
+                ) AS full_name
+            FROM numbux.student s
+            JOIN numbux.student_ec se
+              ON se.id_student = s.id_student
+             AND se.id_ec = :id_ec
+             AND (se.status ILIKE 'active' OR se.status IS NULL)
+            ORDER BY
+                s.first_last_name NULLS LAST,
+                s.second_last_name NULLS LAST,
+                s.first_name NULLS LAST
+        """), {"id_ec": resolved_id_ec}).mappings().all()
+
+    # is_locked / want_lock / code can be None or default False, etc.
+    return [
+        AdminStudentWithStatusOut(
+            id_student=row["id_student"],
+            first_name=row["first_name"] or None,
+            first_last_name=row["first_last_name"] or None,
+            second_last_name=row["second_last_name"] or None,
+            full_name=row["full_name"],
+            email=row["email"],
+            id_ec=row["id_ec"],
+            is_locked=False,
+            want_lock=None,
+            code=None,
+        )
+        for row in rows
+    ]
+
+
+@app.post("/api/admin/students", response_model=AdminStudentOut)
+def admin_create_student(body: AdminCreateStudent, user=Depends(get_current_user)):
+    # Only admins can create students
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can create students")
+
+    email_lower = body.email.lower()
+
+    with engine.begin() as conn:
+        # 1) Ensure email is not already used by any user type
+        _ensure_email_not_exists(conn, email_lower)
+
+        # 2) Resolve educational center depending on admin role
+        if user["role"] == "admin_ec":
+            # Admin EC: must belong to exactly one active center
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            admin_ec_id = int(row["id_ec"])
+
+            # If body.id_ec is present, enforce it matches
+            if body.id_ec is not None and int(body.id_ec) != admin_ec_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot create students in another educational center"
+                )
+
+            id_ec = admin_ec_id
+
+        else:  # admin_numbux
+            # Platform admin must explicitly choose the center
+            if body.id_ec is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="id_ec is required for platform admins"
+                )
+            id_ec = int(body.id_ec)
+
+        # 3) Insert into numbux.student
+        student_id = conn.execute(text("""
+            INSERT INTO numbux.student
+                (first_name, first_last_name, second_last_name,
+                 email, phone, password_hash,
+                 device_id, push_token, platform)
+            VALUES
+                (:first_name, :first_last_name, :second_last_name,
+                 :email, :phone, :password_hash,
+                 NULL, NULL, NULL)
+            RETURNING id_student
+        """), {
+            "first_name": body.first_name,
+            "first_last_name": body.first_last_name,
+            "second_last_name": body.second_last_name,
+            "email": email_lower,
+            "phone": body.phone,
+            "password_hash": _hash_password(body.password),
+        }).scalar_one()
+
+        # 4) Link student to the center in numbux.student_ec
+        conn.execute(text("""
+            INSERT INTO numbux.student_ec
+                (id_ec, id_student, academic_year, start_date, end_date,
+                 status, license_code, role)
+            VALUES
+                (:id_ec, :id_student, :academic_year, :start_date, NULL,
+                 'active', NULL, 'student')
+        """), {
+            "id_ec": id_ec,
+            "id_student": student_id,
+            "academic_year": None,
+            "start_date": _today_utc_date(),
+        })
+
+        # 5) Read back a normalized view of the student
+        row = conn.execute(text("""
+            SELECT
+                s.id_student,
+                COALESCE(s.first_name, '')         AS first_name,
+                COALESCE(s.first_last_name, '')    AS first_last_name,
+                COALESCE(s.second_last_name, '')   AS second_last_name,
+                s.email,
+                :id_ec                              AS id_ec,
+                CONCAT_WS(
+                    ', ',
+                    NULLIF(CONCAT_WS(' ',
+                        NULLIF(s.first_last_name, ''),
+                        NULLIF(s.second_last_name, '')
+                    ), ''),
+                    NULLIF(s.first_name, '')
+                ) AS full_name
+            FROM numbux.student s
+            WHERE s.id_student = :sid
+        """), {"sid": student_id, "id_ec": id_ec}).mappings().first()
+
+    return AdminStudentOut(**row)
+
+
 # ======= SignUp models =======
 class BaseSignup(BaseModel):
     first_name: str
