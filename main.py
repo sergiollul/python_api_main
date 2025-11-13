@@ -1701,6 +1701,15 @@ class AdminStudentWithStatusOut(AdminStudentOut):
     want_lock: Optional[str] = None
     code: Optional[str] = None
 
+class AdminTeacherOut(BaseModel):
+    id_teacher: int
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    full_name: Optional[str] = None
+    email: EmailStr
+    id_ec: int
+
+
 @app.get("/api/admin/center-students", response_model=list[AdminStudentWithStatusOut])
 def admin_list_center_students(
     id_ec: Optional[int] = Query(None),
@@ -1767,6 +1776,74 @@ def admin_list_center_students(
             is_locked=False,
             want_lock=None,
             code=None,
+        )
+        for row in rows
+    ]
+
+@app.get("/api/admin/center-teachers", response_model=list[AdminTeacherOut])
+def admin_list_center_teachers(
+    id_ec: Optional[int] = Query(None),
+    user = Depends(get_current_user),
+):
+    """
+    List teachers in an educational center.
+
+    - admin_ec: lists teachers for *their* active center (ignores other id_ec).
+    - admin_numbux: must pass id_ec explicitly.
+    """
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can list teachers")
+
+    with engine.begin() as conn:
+        # Resolve center depending on admin role
+        if user["role"] == "admin_ec":
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+            resolved_id_ec = int(row["id_ec"])
+        else:  # admin_numbux
+            if id_ec is None:
+                raise HTTPException(status_code=400, detail="id_ec is required for platform admins")
+            resolved_id_ec = int(id_ec)
+
+        # Fetch teachers linked to this center (active teacher_ec)
+        rows = conn.execute(text("""
+            SELECT
+                t.id_teacher,
+                t.email,
+                COALESCE(t.first_name, '') AS first_name,
+                COALESCE(t.last_name, '')  AS last_name,
+                :id_ec                      AS id_ec,
+                CONCAT_WS(
+                    ', ',
+                    NULLIF(t.last_name, ''),
+                    NULLIF(t.first_name, '')
+                ) AS full_name
+            FROM numbux.teacher t
+            JOIN numbux.teacher_ec te
+              ON te.id_teacher = t.id_teacher
+             AND te.id_ec      = :id_ec
+             AND (te.status ILIKE 'active' OR te.status IS NULL)
+            ORDER BY
+                t.last_name  NULLS LAST,
+                t.first_name NULLS LAST
+        """), {"id_ec": resolved_id_ec}).mappings().all()
+
+    return [
+        AdminTeacherOut(
+            id_teacher=row["id_teacher"],
+            first_name=row["first_name"] or None,
+            last_name=row["last_name"] or None,
+            full_name=row["full_name"],
+            email=row["email"],
+            id_ec=row["id_ec"],
         )
         for row in rows
     ]
