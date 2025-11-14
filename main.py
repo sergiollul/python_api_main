@@ -1709,6 +1709,10 @@ class CenterTeacherCount(BaseModel):
     id_ec: int
     active_teachers: int
 
+class CenterActiveLicenses(BaseModel):
+    id_ec: int
+    total_active_licenses: int
+
 class AdminTeacherOut(BaseModel):
     id_teacher: int
     first_name: Optional[str] = None
@@ -1904,6 +1908,75 @@ def admin_center_teacher_count(
 
     return CenterTeacherCount(id_ec=resolved_id_ec, active_teachers=count)
 
+@app.get("/api/admin/center-licenses/active", response_model=CenterActiveLicenses)
+def admin_center_total_active_licenses(
+    id_ec: Optional[int] = Query(None),
+    user = Depends(get_current_user),
+):
+    """
+    Returns total active licenses for an educational center:
+    - active teachers
+    - active students
+    - active admin_ec users (role = 'admin')
+    """
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can access license counts")
+
+    with engine.begin() as conn:
+
+        # --- Resolve center based on role ---
+        if user["role"] == "admin_ec":
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND (status ILIKE 'active' OR status IS NULL)
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            resolved_id_ec = int(row["id_ec"])
+
+        else:  # admin_numbux
+            if id_ec is None:
+                raise HTTPException(status_code=400, detail="id_ec is required for platform admins")
+            resolved_id_ec = int(id_ec)
+
+        # --- Count total active licenses ---
+        row = conn.execute(text("""
+            SELECT
+                -- Active teachers
+                (SELECT COUNT(*)
+                   FROM numbux.teacher_ec
+                  WHERE id_ec = :id_ec
+                    AND status ILIKE 'active'
+                    AND role = 'teacher')
+                +
+                -- Active students
+                (SELECT COUNT(*)
+                   FROM numbux.student_ec
+                  WHERE id_ec = :id_ec
+                    AND status ILIKE 'active'
+                    AND role = 'student')
+                +
+                -- Active admin users
+                (SELECT COUNT(*)
+                   FROM numbux.admin_ec_ec
+                  WHERE id_ec = :id_ec
+                    AND status ILIKE 'active'
+                    AND role = 'admin')
+                AS total_active_licenses
+        """), {"id_ec": resolved_id_ec}).mappings().first()
+
+        total = int(row["total_active_licenses"]) if row else 0
+
+    return CenterActiveLicenses(
+        id_ec=resolved_id_ec,
+        total_active_licenses=total
+    )
 
 @app.get("/api/admin/center-teachers", response_model=list[AdminTeacherOut])
 def admin_list_center_teachers(
