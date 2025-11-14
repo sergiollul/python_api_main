@@ -1701,6 +1701,10 @@ class AdminStudentWithStatusOut(AdminStudentOut):
     want_lock: Optional[str] = None
     code: Optional[str] = None
 
+class CenterStudentCount(BaseModel):
+    id_ec: int
+    active_students: int
+
 class AdminTeacherOut(BaseModel):
     id_teacher: int
     first_name: Optional[str] = None
@@ -1796,6 +1800,55 @@ def admin_list_center_students(
         )
         for row in rows
     ]
+
+@app.get("/api/admin/center-students/count", response_model=CenterStudentCount)
+def admin_center_student_count(
+    id_ec: Optional[int] = Query(None),
+    user = Depends(get_current_user),
+):
+    """
+    Returns the number of *active* students in an educational center.
+
+    - admin_ec: counts for their own active center (ignores other id_ec).
+    - admin_numbux: must pass id_ec explicitly.
+    """
+    if user["role"] not in {"admin_ec", "admin_numbux"}:
+        raise HTTPException(status_code=403, detail="Only admins can see student counts")
+
+    with engine.begin() as conn:
+        # --- Resolve center depending on admin role ---
+        if user["role"] == "admin_ec":
+            row = conn.execute(text("""
+                SELECT id_ec
+                  FROM numbux.admin_ec_ec
+                 WHERE id_admin = :aid
+                   AND status ILIKE 'active'
+                 ORDER BY start_date DESC NULLS LAST
+                 LIMIT 1
+            """), {"aid": user["user_id"]}).mappings().first()
+
+            if not row:
+                raise HTTPException(status_code=400, detail="Admin has no active educational center")
+
+            resolved_id_ec = int(row["id_ec"])
+
+        else:  # admin_numbux
+            if id_ec is None:
+                raise HTTPException(status_code=400, detail="id_ec is required for platform admins")
+            resolved_id_ec = int(id_ec)
+
+        # --- Count active students in that center ---
+        row = conn.execute(text("""
+            SELECT COUNT(DISTINCT se.id_student) AS cnt
+              FROM numbux.student_ec se
+             WHERE se.id_ec = :id_ec
+               AND se.status ILIKE 'active'
+               AND se.role = 'student'
+        """), {"id_ec": resolved_id_ec}).mappings().first()
+
+        count = int(row["cnt"]) if row and row["cnt"] is not None else 0
+
+    return CenterStudentCount(id_ec=resolved_id_ec, active_students=count)
 
 @app.get("/api/admin/center-teachers", response_model=list[AdminTeacherOut])
 def admin_list_center_teachers(
