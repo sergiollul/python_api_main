@@ -98,7 +98,7 @@ def broadcast_to_classrooms(classroom_ids: list[int], payload: dict):
 license_router = APIRouter()
 
 class LicenseResolveResponse(BaseModel):
-    role: str            # 'student' | 'teacher' | 'admin_ec'
+    role: str            # 'student' | 'teacher' | 'admin'
     id_ec: int
     center_name: str | None = None
 
@@ -133,7 +133,7 @@ def resolve_license(license_code: str = Query(..., alias="license_code")):
         raise HTTPException(status_code=409, detail="License already used")
 
     role = (row["license_type"] or "").strip().lower()
-    if role not in {"student", "teacher", "admin_ec"}:
+    if role not in {"student", "teacher", "admin"}:
         raise HTTPException(status_code=400, detail="Unknown license role")
 
     return {"role": role, "id_ec": int(row["id_ec"]), "center_name": row.get("center_name")}
@@ -251,8 +251,8 @@ LOOKUP_SQL = text("""
         SELECT id::bigint AS user_id, email, password_hash, 'admin_numbux'::text AS role
         FROM numbux.admin_numbux WHERE lower(email) = :email
         UNION ALL
-        SELECT id_admin_ec::bigint AS user_id, email, password_hash, 'admin_ec'::text AS role
-        FROM numbux.admin_ec WHERE lower(email) = :email
+        SELECT id_admin::bigint AS user_id, email, password_hash, 'admin'::text AS role
+        FROM numbux.admin WHERE lower(email) = :email
         UNION ALL
         SELECT id_teacher::bigint AS user_id, email, password_hash, 'teacher'::text AS role
         FROM numbux.teacher WHERE lower(email) = :email
@@ -432,7 +432,7 @@ class ClassroomCreate(BaseModel):
 
 @app.post("/api/teacher/classrooms", response_model=TeacherClassroom)
 def create_classroom(body: ClassroomCreate, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only controllers can create classrooms")
 
     # Fecha por defecto (UTC)
@@ -509,7 +509,7 @@ class ClassroomUpdate(BaseModel):
 @app.patch("/api/teacher/classrooms/{classroom_id}", response_model=TeacherClassroom)
 def update_classroom(classroom_id: int, body: ClassroomUpdate, user=Depends(get_current_user)):
     # Only controllers can modify classrooms
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only controllers can modify classrooms")
 
     # Build dynamic SET clause only for provided fields
@@ -581,7 +581,7 @@ def update_classroom(classroom_id: int, body: ClassroomUpdate, user=Depends(get_
 @app.delete("/api/teacher/classrooms/{classroom_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_classroom(classroom_id: int, user=Depends(get_current_user)):
     # Only controllers can delete classrooms
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only controllers can delete classrooms")
 
     with engine.begin() as conn:
@@ -721,7 +721,7 @@ async def teacher_live(ws: WebSocket):
 
 @app.post("/api/teacher/classrooms/{classroom_id}/join/open", response_model=JoinOpenResponse)
 def open_class_join(classroom_id: int, body: JoinOpenRequest, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can open join")
 
     expires_at = _now_utc() + timedelta(minutes=body.expires_in_minutes)
@@ -764,7 +764,7 @@ def open_class_join(classroom_id: int, body: JoinOpenRequest, user=Depends(get_c
 
 @app.post("/api/teacher/classrooms/{classroom_id}/join/close", response_model=JoinCloseResponse)
 def close_class_join(classroom_id: int, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can close join")
 
     with engine.begin() as conn:
@@ -939,14 +939,14 @@ def admin_center_classrooms(
     id_ec: Optional[int] = Query(None, description="Educational center ID (required for admin_numbux)"),
     user=Depends(get_current_user)
 ):
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can list center classrooms")
 
     with engine.connect() as conn:
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -981,8 +981,8 @@ class SignoutPinResponse(BaseModel):
 @app.post("/api/admin/students/{student_id}/signout-pin", response_model=SignoutPinResponse)
 def create_signout_pin(student_id: int, user=Depends(get_current_user)):
     # Only admin_ec can mint sign-out PINs
-    if user["role"] != "admin_ec":
-        raise HTTPException(status_code=403, detail="Only admin_ec can create sign-out PINs")
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can create sign-out PINs")
 
     expires_at = _now_utc() + timedelta(minutes=10)
     pin = f"{secrets.randbelow(1_000_000):06d}"  # zero-padded 6-digit
@@ -991,7 +991,7 @@ def create_signout_pin(student_id: int, user=Depends(get_current_user)):
         # 1) Admin's active educational center
         admin_ec_row = conn.execute(text("""
             SELECT id_ec
-              FROM numbux.admin_ec_ec
+              FROM numbux.admin_ec
              WHERE id_admin = :aid
                AND (status ILIKE 'active' OR status IS NULL)
              ORDER BY start_date DESC NULLS LAST
@@ -1046,7 +1046,7 @@ class StudentInClass(BaseModel):
 
 @app.get("/api/teacher/classrooms/{classroom_id}/students", response_model=List[StudentInClass])
 def list_students_in_classroom(classroom_id: int, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can list students")
 
     with engine.connect() as conn:
@@ -1201,8 +1201,8 @@ class LogoutResponse(BaseModel):
 @app.post("/api/admin/logout", response_model=LogoutResponse)
 def admin_logout(body: LogoutRequest = None, user=Depends(get_current_user)):
     # Only admin_ec can use this endpoint
-    if user["role"] != "admin_ec":
-        raise HTTPException(status_code=403, detail="Only admin_ec can log out via this endpoint")
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can log out via this endpoint")
 
     # If a refresh token is supplied, validate it belongs to the same admin and is a refresh token
     if body and body.refresh_token:
@@ -1210,7 +1210,7 @@ def admin_logout(body: LogoutRequest = None, user=Depends(get_current_user)):
             payload = jwt.decode(body.refresh_token, REFRESH_SECRET, algorithms=[JWT_ALGORITHM])
             if payload.get("typ") != "refresh":
                 raise HTTPException(status_code=400, detail="Provided token is not a refresh token")
-            if str(payload.get("sub")) != str(user["user_id"]) or payload.get("role") != "admin_ec":
+            if str(payload.get("sub")) != str(user["user_id"]) or payload.get("role") != "admin":
                 # Don't leak details: just reject
                 raise HTTPException(status_code=401, detail="Invalid refresh token for this admin")
         except JWTError:
@@ -1353,7 +1353,7 @@ class OrderBody(BaseModel):
 
 @app.post("/api/teacher/classrooms/{classroom_id}/order")
 def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can order lock/unlock")
 
     action = (body.action or "").upper()
@@ -1419,7 +1419,7 @@ def teacher_order_class(classroom_id: int, body: OrderBody, user=Depends(get_cur
 
 @app.post("/api/teacher/students/{student_id}/order")
 def teacher_order_student_global(student_id: int, body: OrderBody, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can order lock/unlock")
 
     action = (body.action or "").upper()
@@ -1463,7 +1463,7 @@ def teacher_order_student_global(student_id: int, body: OrderBody, user=Depends(
 
 @app.post("/api/teacher/classrooms/{classroom_id}/students/{student_id}/order")
 def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(403, "Only controllers can order lock/unlock")
 
     action = (body.action or "").upper()
@@ -1523,7 +1523,7 @@ def teacher_order_student(classroom_id: int, student_id: int, body: OrderBody, u
 # --- Remove a student from a classroom ---
 @app.delete("/api/teacher/classrooms/{classroom_id}/students/{student_id}", status_code=204)
 def remove_student_from_classroom(classroom_id: int, student_id: int, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only controllers can remove students")
 
     with engine.begin() as conn:
@@ -1596,7 +1596,7 @@ class StudentUpdatedOut(BaseModel):
 
 @app.patch("/api/teacher/students/{student_id}", response_model=StudentUpdatedOut)
 def update_student_partial(student_id: int, body: StudentUpdate, user=Depends(get_current_user)):
-    if user["role"] not in {"teacher", "admin_ec", "admin_numbux"}:
+    if user["role"] not in {"teacher", "admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only controllers can modify students")
 
     set_clauses = []
@@ -1744,14 +1744,14 @@ def admin_list_center_students(
     id_ec: Optional[int] = Query(None),
     user = Depends(get_current_user),
 ):
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can list students")
 
     with engine.begin() as conn:
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -1817,18 +1817,18 @@ def admin_center_student_count(
     """
     Returns the number of *active* students in an educational center.
 
-    - admin_ec: counts for their own active center (ignores other id_ec).
+    - admin: counts for their own active center (ignores other id_ec).
     - admin_numbux: must pass id_ec explicitly.
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can see student counts")
 
     with engine.begin() as conn:
         # --- Resolve center depending on admin role ---
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND status ILIKE 'active'
                  ORDER BY start_date DESC NULLS LAST
@@ -1867,18 +1867,18 @@ def admin_center_teacher_count(
     """
     Returns the number of *active* teachers in an educational center.
 
-    - admin_ec: counts for their own active center (ignores other id_ec).
+    - admin: counts for their own active center (ignores other id_ec).
     - admin_numbux: must pass id_ec explicitly.
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can see teacher counts")
 
     with engine.begin() as conn:
         # --- Resolve center depending on admin role ---
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND status ILIKE 'active'
                  ORDER BY start_date DESC NULLS LAST
@@ -1917,18 +1917,18 @@ def admin_center_total_active_licenses(
     Returns total active licenses for an educational center:
     - active teachers
     - active students
-    - active admin_ec users (role = 'admin')
+    - active admin users (role = 'admin')
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can access license counts")
 
     with engine.begin() as conn:
 
         # --- Resolve center based on role ---
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -1964,7 +1964,7 @@ def admin_center_total_active_licenses(
                 +
                 -- Active admin users
                 (SELECT COUNT(*)
-                   FROM numbux.admin_ec_ec
+                   FROM numbux.admin_ec
                   WHERE id_ec = :id_ec
                     AND status ILIKE 'active'
                     AND role = 'admin')
@@ -1986,18 +1986,18 @@ def admin_list_center_teachers(
     """
     List teachers in an educational center.
 
-    - admin_ec: lists teachers for *their* active center (ignores other id_ec).
+    - admin: lists teachers for *their* active center (ignores other id_ec).
     - admin_numbux: must pass id_ec explicitly.
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can list teachers")
 
     with engine.begin() as conn:
         # Resolve center depending on admin role
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -2049,7 +2049,7 @@ def admin_list_center_teachers(
 @app.post("/api/admin/teachers", response_model=AdminTeacherOut)
 def admin_create_teacher(body: AdminCreateTeacher, user=Depends(get_current_user)):
     # Only admins can create teachers
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can create teachers")
 
     email_lower = body.email.lower()
@@ -2059,11 +2059,11 @@ def admin_create_teacher(body: AdminCreateTeacher, user=Depends(get_current_user
         _ensure_email_not_exists(conn, email_lower)
 
         # 2) Resolve educational center depending on admin role
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             # Admin EC: must belong to exactly one active center
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -2148,10 +2148,10 @@ def admin_update_teacher(teacher_id: int, body: AdminUpdateTeacher, user=Depends
     """
     Edit a teacher's basic data (name, email, phone).
 
-    - admin_ec: can only edit teachers that belong to their active educational center.
+    - admin: can only edit teachers that belong to their active educational center.
     - admin_numbux: can edit any teacher (but teacher must be linked to some center).
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can edit teachers")
 
     # Helper to normalize strings; treat blank "" as "no change"
@@ -2186,10 +2186,10 @@ def admin_update_teacher(teacher_id: int, body: AdminUpdateTeacher, user=Depends
         current_email_lower = (teacher_row["email"] or "").lower()
 
         # --- Resolve educational center and enforce scope ---
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             admin_ec_row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -2290,18 +2290,18 @@ def admin_delete_teacher(teacher_id: int, user=Depends(get_current_user)):
     """
     Delete a teacher account.
 
-    - admin_ec: can only delete teachers that belong to their active educational center.
+    - admin: can only delete teachers that belong to their active educational center.
     - admin_numbux: can delete any teacher.
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can delete teachers")
 
     with engine.begin() as conn:
         # --- Scope check for admin_ec ---
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             admin_ec_row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -2353,7 +2353,7 @@ def admin_delete_teacher(teacher_id: int, user=Depends(get_current_user)):
 @app.post("/api/admin/students", response_model=AdminStudentOut)
 def admin_create_student(body: AdminCreateStudent, user=Depends(get_current_user)):
     # Only admins can create students
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can create students")
 
     email_lower = body.email.lower()
@@ -2363,11 +2363,11 @@ def admin_create_student(body: AdminCreateStudent, user=Depends(get_current_user
         _ensure_email_not_exists(conn, email_lower)
 
         # 2) Resolve educational center depending on admin role
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             # Admin EC: must belong to exactly one active center
             row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -2459,18 +2459,18 @@ def admin_delete_student(student_id: int, user=Depends(get_current_user)):
     """
     Delete a student account.
 
-    - admin_ec: can only delete students that belong to their active educational center.
+    - admin: can only delete students that belong to their active educational center.
     - admin_numbux: can delete any student.
     """
-    if user["role"] not in {"admin_ec", "admin_numbux"}:
+    if user["role"] not in {"admin", "admin_numbux"}:
         raise HTTPException(status_code=403, detail="Only admins can delete students")
 
     with engine.begin() as conn:
         # --- Scope check for admin_ec ---
-        if user["role"] == "admin_ec":
+        if user["role"] == "admin":
             admin_ec_row = conn.execute(text("""
                 SELECT id_ec
-                  FROM numbux.admin_ec_ec
+                  FROM numbux.admin_ec
                  WHERE id_admin = :aid
                    AND (status ILIKE 'active' OR status IS NULL)
                  ORDER BY start_date DESC NULLS LAST
@@ -2731,9 +2731,9 @@ def signup_admin_ec(body: AdminECSignup):
         id_ec = _claim_license_and_get_center(conn, body.license_code, email_lower, body.id_ec)
 
         insert_admin_ec = text("""
-            INSERT INTO numbux.admin_ec (first_name, last_name, email, phone, password_hash)
+            INSERT INTO numbux.admin (first_name, last_name, email, phone, password_hash)
             VALUES (:first_name, :last_name, :email, :phone, :password_hash)
-            RETURNING id_admin_ec
+            RETURNING id_admin
         """)
         admin_ec_id = conn.execute(
             insert_admin_ec,
@@ -2747,8 +2747,8 @@ def signup_admin_ec(body: AdminECSignup):
         ).scalar_one()
 
         insert_admin_ec_ec = text("""
-            INSERT INTO numbux.admin_ec_ec (id_ec, id_admin, academic_year, start_date, end_date, status, license_code, role)
-            VALUES (:id_ec, :id_admin, :academic_year, :start_date, NULL, 'active', :license_code, 'admin_ec')
+            INSERT INTO numbux.admin_ec (id_ec, id_admin, academic_year, start_date, end_date, status, license_code, role)
+            VALUES (:id_ec, :id_admin, :academic_year, :start_date, NULL, 'active', :license_code, 'admin')
         """)
         conn.execute(
             insert_admin_ec_ec,
@@ -2761,4 +2761,4 @@ def signup_admin_ec(body: AdminECSignup):
             }
         )
 
-    return _issue_tokens(admin_ec_id, email_lower, "admin_ec")
+    return _issue_tokens(admin_ec_id, email_lower, "admin")
