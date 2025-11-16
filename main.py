@@ -2743,25 +2743,36 @@ def send_reset_email(to_email: str, reset_url: str):
     msg["To"] = to_email
 
     text_body = (
-        "Has solicitado restablecer tu contraseña de NumbuX.\n\n"
+        "Has solicitado restablecer tu contraseña de NumbuX.\n"
+        "Si tú no has solicitado este cambio, puedes ignorar este correo.\n\n"
         f"Para continuar, haz clic en el siguiente enlace:\n{reset_url}\n\n"
         "Si tú no has solicitado este cambio, puedes ignorar este correo."
     )
 
+
     html_body = f"""
     <html>
-      <body>
-        <p>Has solicitado restablecer tu contraseña de <strong>Numbux</strong>.</p>
-        <p>
-          Para continuar, haz clic en el siguiente enlace:<br>
-          <a href="{reset_url}">{reset_url}</a>
-        </p>
-        <p style="font-size: 0.9em; color: #666;">
-          Si tú no has solicitado este cambio, puedes ignorar este correo.
-        </p>
-      </body>
+        <body>
+            <p>
+            Has solicitado restablecer tu contraseña de <strong>NumbuX</strong>.
+            </p>
+
+            <p style="font-size: 0.9em; color: #666;">
+            Si tú no has solicitado este cambio, puedes ignorar este correo.
+            </p>
+
+            <p>
+            Para continuar, haz clic en el siguiente enlace:<br>
+            <a href="{reset_url}">{reset_url}</a>
+            </p>
+
+            <p style="font-size: 0.9em; color: #666;">
+            Si tú no has solicitado este cambio, puedes ignorar este correo.
+            </p>
+        </body>
     </html>
     """
+
 
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
