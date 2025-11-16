@@ -2,7 +2,7 @@
 import os
 import sys
 from datetime import datetime, timedelta, timezone, date
-from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect, status, Form
+from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect, status, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
@@ -19,6 +19,9 @@ import secrets, base64
 import logging
 from typing import Optional
 import re
+import smtplib
+from email.message import EmailMessage
+
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -44,6 +47,13 @@ ROTATE_REFRESH      = os.getenv("ROTATE_REFRESH", "true").lower() == "true"
 # === Reset Password ===
 RESET_SECRET      = os.getenv("RESET_SECRET", JWT_SECRET)
 RESET_EXPIRE_MIN  = int(os.getenv("RESET_EXPIRE_MIN", "15"))  # 15 minutes
+
+SMTP_HOST      = must_get("SMTP_HOST")
+SMTP_PORT      = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER      = must_get("SMTP_USER")
+SMTP_PASSWORD  = must_get("SMTP_PASSWORD")
+SMTP_FROM      = os.getenv("SMTP_FROM", SMTP_USER)
+
 
 # Server-side password strength check (same rules as the HTML/JS)
 PASSWORD_REGEX = re.compile(
@@ -2722,6 +2732,46 @@ def _issue_tokens(user_id: int, email: str, role: str) -> TokenResponse:
         email=email,
     )
 
+def send_reset_email(to_email: str, reset_url: str):
+    """
+    Envía un email de restablecimiento de contraseña con el enlace reset_url.
+    Usa la cuenta info@numbux.com (SMTP_SSL, puerto 465).
+    """
+    msg = EmailMessage()
+    msg["Subject"] = "Numbux – Restablece tu contraseña"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    text_body = (
+        "Has solicitado restablecer tu contraseña de NumbuX.\n\n"
+        f"Para continuar, haz clic en el siguiente enlace:\n{reset_url}\n\n"
+        "Si tú no has solicitado este cambio, puedes ignorar este correo."
+    )
+
+    html_body = f"""
+    <html>
+      <body>
+        <p>Has solicitado restablecer tu contraseña de <strong>Numbux</strong>.</p>
+        <p>
+          Para continuar, haz clic en el siguiente enlace:<br>
+          <a href="{reset_url}">{reset_url}</a>
+        </p>
+        <p style="font-size: 0.9em; color: #666;">
+          Si tú no has solicitado este cambio, puedes ignorar este correo.
+        </p>
+      </body>
+    </html>
+    """
+
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    # Tu servidor: SSL/TLS en puerto 465 -> SMTP_SSL
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.login(SMTP_USER, SMTP_PASSWORD)
+        smtp.send_message(msg)
+
+
 # ======= /signup/student =======
 @app.post("/signup/student", response_model=TokenResponse)
 def signup_student(body: StudentSignup):
@@ -2859,13 +2909,45 @@ def signup_admin_ec(body: AdminECSignup):
     return _issue_tokens(admin_ec_id, email_lower, "admin")
 
 
-# ====================================
-# === PROBAR EN DESARROLLO RESETEO ===
-# ====================================
-
+# === Send Email with link to Reset Password ===
 class PasswordResetRequest(BaseModel):
     email: EmailStr
 
+@app.post("/password/reset-link")
+def create_reset_link(
+    body: PasswordResetRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Dado un email, si existe un usuario:
+    - genera un token de reset
+    - envía un email con el enlace de reseteo
+
+    Siempre devuelve una respuesta genérica para evitar user-enumeration.
+    """
+    email_lower = body.email.lower()
+
+    with engine.connect() as conn:
+        row = conn.execute(LOOKUP_SQL, {"email": email_lower}).mappings().first()
+
+    # Respuesta genérica (tanto si el usuario existe como si no)
+    generic_response = {
+        "ok": True,
+        "message": "Si ese email existe, recibirás un enlace para restablecer la contraseña en unos minutos.",
+    }
+
+    # Si no existe ningún usuario con ese email → no hacemos nada más
+    if not row:
+        return generic_response
+
+    # Usuario encontrado → generamos el token y la URL
+    token = create_reset_token(email_lower, row["role"], row["user_id"])
+    reset_url = f"https://api.numbux.com/reset-password?token={token}"
+
+    # Enviar el email en segundo plano (sin bloquear la respuesta)
+    background_tasks.add_task(send_reset_email, email_lower, reset_url)
+
+    return generic_response
 
 RESET_PASSWORD_HTML = """
 <!DOCTYPE html>
@@ -3208,27 +3290,6 @@ RESET_PASSWORD_HTML = """
 </body>
 </html>
 """
-
-
-@app.post("/password/reset-link")
-def create_reset_link(body: PasswordResetRequest):
-    """
-    Dev/test helper: given an email, returns a reset link.
-    In production you’d send this via email instead of returning it.
-    """
-    email_lower = body.email.lower()
-    with engine.connect() as conn:
-        row = conn.execute(LOOKUP_SQL, {"email": email_lower}).mappings().first()
-
-    # No user enumeration
-    if not row:
-        return {"ok": True, "message": "If that email exists, you will receive a reset link shortly."}
-
-    token = create_reset_token(email_lower, row["role"], row["user_id"])
-    reset_url = f"https://api.numbux.com/reset-password?token={token}"
-
-    return {"ok": True, "reset_url": reset_url}
-
 
 @app.get("/reset-password", response_class=HTMLResponse)
 def reset_password_page(token: str):
