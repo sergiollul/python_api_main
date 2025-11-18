@@ -460,7 +460,7 @@ def mdm_enroll_profile():
     mdm_payload_uuid = str(uuid4())
     checkin_url = "https://mdm.numbux.com/mdm/checkin"
     command_url = "https://mdm.numbux.com/mdm/command"
-    topic       = "com.numbux.mdm"   # MUST match your APNs MDM topic
+    topic = "com.apple.mgmt.External.c4a94ee1-7fbe-4ead-8d24-4b6675d3981f"   # MUST match your APNs MDM topic
 
     mdm_payload = {
         "PayloadType": "com.apple.mdm",
