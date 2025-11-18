@@ -2,7 +2,8 @@
 import os
 import sys
 from datetime import datetime, timedelta, timezone, date
-from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect, status, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, APIRouter, WebSocket, WebSocketDisconnect, status, Form, BackgroundTasks, Request, Response
+import plistlib
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
@@ -361,6 +362,371 @@ def get_current_user(authorization: str = Header(None)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
     
+
+# === MDM client certificate "auth" (no JWT) ===
+def require_mdm_client_cert(
+    ssl_client_verify: str | None = Header(None, alias="x-ssl-client-verify"),
+    ssl_client_subject: str | None = Header(None, alias="x-ssl-client-subject-dn"),
+    ssl_client_serial: str | None = Header(None, alias="x-ssl-client-serial"),
+):
+    """
+    Used only on /mdm/* endpoints.
+    Nginx/Plesk fills these headers based on TLS client certificates.
+    """
+    # For now we just log; later you can enforce SUCCESS strictly.
+    print("[MDM][CERT]", ssl_client_verify, ssl_client_subject, ssl_client_serial)
+
+    # When you’re ready to enforce:
+    # if ssl_client_verify != "SUCCESS":
+    #     raise HTTPException(status_code=403, detail="MDM client certificate required")
+
+    return {
+        "subject_dn": ssl_client_subject,
+        "serial": ssl_client_serial,
+    }
+
+
+def _parse_plist_body(raw: bytes) -> dict:
+    try:
+        if not raw:
+            raise ValueError("Empty body")
+        return plistlib.loads(raw)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid plist: {e.__class__.__name__}")
+
+
+# === Apple MDM check-in & command endpoints (plist, no JWT) ===
+mdm_plist_router = APIRouter()
+
+@mdm_plist_router.post("/mdm/checkin")
+async def mdm_checkin(
+    request: Request,
+    client_cert = Depends(require_mdm_client_cert),
+):
+    """
+    Apple MDM check-in endpoint.
+
+    Handles:
+      - MessageType = "Authenticate"
+      - MessageType = "TokenUpdate"
+      - MessageType = "CheckOut"
+
+    Persists into:
+      - numbux.mdm_ios_device       (current device state per UDID)
+      - numbux.mdm_ios_checkin_log  (raw plist audit log)
+    """
+    raw = await request.body()
+    payload = _parse_plist_body(raw)
+
+    msg_type = payload.get("MessageType")
+    udid     = payload.get("UDID")
+
+    if not msg_type or not udid:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing MessageType or UDID in check-in payload"
+        )
+
+    # Common device metadata (keys used by Apple)
+    device_name   = payload.get("DeviceName") or payload.get("DeviceNameRaw")
+    os_version    = payload.get("OSVersion")
+    build_version = payload.get("BuildVersion")
+    model         = payload.get("Model") or payload.get("ProductName")
+    serial_number = payload.get("SerialNumber")
+    imei          = payload.get("IMEI")
+    meid          = payload.get("MEID")
+
+    # For TokenUpdate
+    topic        = payload.get("Topic")
+    push_magic   = payload.get("PushMagic")
+    token_bytes  = payload.get("Token")        # bytes from plist
+    unlock_bytes = payload.get("UnlockToken")  # bytes from plist
+
+    client_subject = client_cert.get("subject_dn")
+    client_serial  = client_cert.get("serial")
+
+    # Encode raw plist into text for mdm_ios_checkin_log.raw_plist
+    # Try UTF-8; if it fails (binary plist), fall back to base64.
+    import base64
+    try:
+        raw_plist_str = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raw_plist_str = "BASE64:" + base64.b64encode(raw).decode("ascii")
+
+    now_utc = _now_utc()
+
+    try:
+        with engine.begin() as conn:
+            # Optionally: try to link UDID to an existing student by device_id
+            student_row = conn.execute(text("""
+                SELECT
+                    s.id_student,
+                    se.id_ec
+                FROM numbux.student s
+                LEFT JOIN numbux.student_ec se
+                       ON se.id_student = s.id_student
+                      AND (se.status ILIKE 'active' OR se.status IS NULL)
+                WHERE s.device_id = :udid
+                ORDER BY se.start_date DESC NULLS LAST
+                LIMIT 1
+            """), {"udid": udid}).mappings().first()
+
+            id_student = student_row["id_student"] if student_row else None
+            id_ec      = student_row["id_ec"] if student_row else None
+
+            id_mdm_ios_device = None
+
+            if msg_type == "Authenticate":
+                # First step: device identifies itself.
+                row = conn.execute(text("""
+                    INSERT INTO numbux.mdm_ios_device
+                        (udid,
+                         serial_number,
+                         imei,
+                         meid,
+                         device_name,
+                         model,
+                         os_version,
+                         build_version,
+                         id_student,
+                         id_ec,
+                         cert_subject_dn,
+                         cert_serial,
+                         is_enrolled,
+                         enrolled_at,
+                         last_checkin_at,
+                         last_seen_at,
+                         updated_at)
+                    VALUES
+                        (:udid,
+                         :serial_number,
+                         :imei,
+                         :meid,
+                         :device_name,
+                         :model,
+                         :os_version,
+                         :build_version,
+                         :id_student,
+                         :id_ec,
+                         :cert_subject_dn,
+                         :cert_serial,
+                         TRUE,
+                         :now,
+                         :now,
+                         :now,
+                         :now)
+                    ON CONFLICT (udid)
+                    DO UPDATE
+                       SET serial_number   = COALESCE(EXCLUDED.serial_number,   numbux.mdm_ios_device.serial_number),
+                           imei            = COALESCE(EXCLUDED.imei,            numbux.mdm_ios_device.imei),
+                           meid            = COALESCE(EXCLUDED.meid,            numbux.mdm_ios_device.meid),
+                           device_name     = COALESCE(EXCLUDED.device_name,     numbux.mdm_ios_device.device_name),
+                           model           = COALESCE(EXCLUDED.model,           numbux.mdm_ios_device.model),
+                           os_version      = COALESCE(EXCLUDED.os_version,      numbux.mdm_ios_device.os_version),
+                           build_version   = COALESCE(EXCLUDED.build_version,   numbux.mdm_ios_device.build_version),
+                           id_student      = COALESCE(EXCLUDED.id_student,      numbux.mdm_ios_device.id_student),
+                           id_ec           = COALESCE(EXCLUDED.id_ec,           numbux.mdm_ios_device.id_ec),
+                           cert_subject_dn = COALESCE(EXCLUDED.cert_subject_dn, numbux.mdm_ios_device.cert_subject_dn),
+                           cert_serial     = COALESCE(EXCLUDED.cert_serial,     numbux.mdm_ios_device.cert_serial),
+                           is_enrolled     = TRUE,
+                           last_checkin_at = :now,
+                           last_seen_at    = :now,
+                           updated_at      = :now
+                    RETURNING id_mdm_ios_device
+                """), {
+                    "udid": udid,
+                    "serial_number": serial_number,
+                    "imei": imei,
+                    "meid": meid,
+                    "device_name": device_name,
+                    "model": model,
+                    "os_version": os_version,
+                    "build_version": build_version,
+                    "id_student": id_student,
+                    "id_ec": id_ec,
+                    "cert_subject_dn": client_subject,
+                    "cert_serial": client_serial,
+                    "now": now_utc,
+                }).mappings().first()
+
+                if row:
+                    id_mdm_ios_device = row["id_mdm_ios_device"]
+
+            elif msg_type == "TokenUpdate":
+                # Second step: APNs token, PushMagic, UnlockToken.
+                row = conn.execute(text("""
+                    INSERT INTO numbux.mdm_ios_device
+                        (udid,
+                         serial_number,
+                         imei,
+                         meid,
+                         device_name,
+                         model,
+                         os_version,
+                         build_version,
+                         id_student,
+                         id_ec,
+                         topic,
+                         push_token,
+                         push_magic,
+                         unlock_token,
+                         cert_subject_dn,
+                         cert_serial,
+                         is_enrolled,
+                         enrolled_at,
+                         last_checkin_at,
+                         last_token_update_at,
+                         last_seen_at,
+                         updated_at)
+                    VALUES
+                        (:udid,
+                         :serial_number,
+                         :imei,
+                         :meid,
+                         :device_name,
+                         :model,
+                         :os_version,
+                         :build_version,
+                         :id_student,
+                         :id_ec,
+                         :topic,
+                         :push_token,
+                         :push_magic,
+                         :unlock_token,
+                         :cert_subject_dn,
+                         :cert_serial,
+                         TRUE,
+                         :now,
+                         :now,
+                         :now,
+                         :now,
+                         :now)
+                    ON CONFLICT (udid)
+                    DO UPDATE
+                       SET serial_number        = COALESCE(EXCLUDED.serial_number,   numbux.mdm_ios_device.serial_number),
+                           imei                 = COALESCE(EXCLUDED.imei,            numbux.mdm_ios_device.imei),
+                           meid                 = COALESCE(EXCLUDED.meid,            numbux.mdm_ios_device.meid),
+                           device_name          = COALESCE(EXCLUDED.device_name,     numbux.mdm_ios_device.device_name),
+                           model                = COALESCE(EXCLUDED.model,           numbux.mdm_ios_device.model),
+                           os_version           = COALESCE(EXCLUDED.os_version,      numbux.mdm_ios_device.os_version),
+                           build_version        = COALESCE(EXCLUDED.build_version,   numbux.mdm_ios_device.build_version),
+                           id_student           = COALESCE(EXCLUDED.id_student,      numbux.mdm_ios_device.id_student),
+                           id_ec                = COALESCE(EXCLUDED.id_ec,           numbux.mdm_ios_device.id_ec),
+                           topic                = COALESCE(EXCLUDED.topic,           numbux.mdm_ios_device.topic),
+                           push_token           = COALESCE(EXCLUDED.push_token,      numbux.mdm_ios_device.push_token),
+                           push_magic           = COALESCE(EXCLUDED.push_magic,      numbux.mdm_ios_device.push_magic),
+                           unlock_token         = COALESCE(EXCLUDED.unlock_token,    numbux.mdm_ios_device.unlock_token),
+                           cert_subject_dn      = COALESCE(EXCLUDED.cert_subject_dn, numbux.mdm_ios_device.cert_subject_dn),
+                           cert_serial          = COALESCE(EXCLUDED.cert_serial,     numbux.mdm_ios_device.cert_serial),
+                           is_enrolled          = TRUE,
+                           last_checkin_at      = :now,
+                           last_token_update_at = :now,
+                           last_seen_at         = :now,
+                           updated_at           = :now
+                    RETURNING id_mdm_ios_device
+                """), {
+                    "udid": udid,
+                    "serial_number": serial_number,
+                    "imei": imei,
+                    "meid": meid,
+                    "device_name": device_name,
+                    "model": model,
+                    "os_version": os_version,
+                    "build_version": build_version,
+                    "id_student": id_student,
+                    "id_ec": id_ec,
+                    "topic": topic,
+                    "push_token": token_bytes,
+                    "push_magic": push_magic,
+                    "unlock_token": unlock_bytes,
+                    "cert_subject_dn": client_subject,
+                    "cert_serial": client_serial,
+                    "now": now_utc,
+                }).mappings().first()
+
+                if row:
+                    id_mdm_ios_device = row["id_mdm_ios_device"]
+
+            else:
+                # Other MessageTypes: CheckOut, etc.
+                row = conn.execute(text("""
+                    SELECT id_mdm_ios_device
+                      FROM numbux.mdm_ios_device
+                     WHERE udid = :udid
+                     LIMIT 1
+                """), {"udid": udid}).mappings().first()
+                if row:
+                    id_mdm_ios_device = row["id_mdm_ios_device"]
+
+                if msg_type == "CheckOut":
+                    conn.execute(text("""
+                        UPDATE numbux.mdm_ios_device
+                           SET is_enrolled     = FALSE,
+                               unenrolled_at   = :now,
+                               last_checkin_at = :now,
+                               last_seen_at    = :now,
+                               updated_at      = :now
+                         WHERE udid = :udid
+                    """), {"udid": udid, "now": now_utc})
+                else:
+                    # Any other check-in → just bump last_seen/checkin
+                    conn.execute(text("""
+                        UPDATE numbux.mdm_ios_device
+                           SET last_checkin_at = :now,
+                               last_seen_at    = :now,
+                               updated_at      = :now
+                         WHERE udid = :udid
+                    """), {"udid": udid, "now": now_utc})
+
+            # Finally: log the raw plist
+            conn.execute(text("""
+                INSERT INTO numbux.mdm_ios_checkin_log
+                    (id_mdm_ios_device, message_type, raw_plist)
+                VALUES
+                    (:id_dev, :msg_type, :raw_plist)
+            """), {
+                "id_dev": id_mdm_ios_device,
+                "msg_type": msg_type,
+                "raw_plist": raw_plist_str,
+            })
+
+    except Exception as e:
+        # Helpful during bring-up; you can remove once stable.
+        print("[MDM][CHECKIN][ERROR]", e.__class__.__name__, str(e))
+        raise HTTPException(status_code=500, detail="MDM check-in failed")
+
+    # Apple is happy with an empty 200 OK.
+    return Response(content=b"", media_type="application/xml")
+
+
+@mdm_plist_router.post("/mdm/command")
+async def mdm_command(
+    request: Request,
+    client_cert = Depends(require_mdm_client_cert),
+):
+    """
+    Apple MDM command channel endpoint.
+    Device posts its Status; if Status == 'Idle', we may respond with a Command plist.
+    """
+    raw = await request.body()
+    payload = _parse_plist_body(raw)
+
+    status   = payload.get("Status")       # "Idle" | "Acknowledged" | "Error" | ...
+    udid     = payload.get("UDID")
+    cmd_uuid = payload.get("CommandUUID")
+
+    print("[MDM][CMD] Status=", status, "UDID=", udid, "CommandUUID=", cmd_uuid)
+
+    # TODO:
+    #   - if status == "Idle":
+    #         fetch next pending command for this UDID from DB,
+    #         plistlib.dumps(...) and return it.
+    #   - else (Acknowledged/Error):
+    #         update command status in DB with payload details.
+
+    # For now: no command → empty 200
+    return Response(content=b"", media_type="application/xml")
+
 
 # === FCM (server → device) ===
 FCM_PROJECT_ID = must_get("FCM_PROJECT_ID")
@@ -1406,9 +1772,10 @@ def device_toggle_report(body: ToggleReport, user=Depends(get_current_user)):
     return {"ok": True}
 
 
+# Mount Apple MDM plist endpoints (no /api prefix, no JWT)
+app.include_router(mdm_plist_router)
 
-
-# Mount under /api
+# Mount JSON MDM endpoints under /api
 app.include_router(mdm_router, prefix="/api")
 
 
