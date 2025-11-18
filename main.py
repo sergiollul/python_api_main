@@ -812,6 +812,30 @@ async def mdm_checkin(
     return Response(content=b"", media_type="application/xml")
 
 
+@mdm_plist_router.get("/mdm/checkin")
+async def mdm_checkin_probe():
+    """
+    Probe endpoint for iOS during profile installation.
+
+    iOS may do a GET to the CheckInURL just to verify the server.
+    We return 200 OK with an empty (but valid) XML body.
+    """
+    return Response(
+        content=b"",               # empty body is fine
+        media_type="application/xml",
+    )
+
+
+@mdm_plist_router.head("/mdm/checkin")
+async def mdm_checkin_head():
+    """
+    Some clients (including Apple during enrollment / verification) may issue
+    HEAD requests to the CheckInURL. We return 200 OK with no body.
+    """
+    return Response(content=b"", media_type="application/xml")
+
+
+
 @mdm_plist_router.post("/mdm/command")
 async def mdm_command(
     request: Request,
@@ -957,6 +981,9 @@ async def mdm_command(
         # Any other status → just 200 OK, empty body
         return Response(content=b"", media_type="application/xml")
 
+
+# Mount Apple MDM plist endpoints (no /api prefix, no JWT)
+app.include_router(mdm_plist_router)
 
 # === FCM (server → device) ===
 FCM_PROJECT_ID = must_get("FCM_PROJECT_ID")
@@ -2000,10 +2027,6 @@ def device_toggle_report(body: ToggleReport, user=Depends(get_current_user)):
 
     broadcast_student_toggle(student_id=user["user_id"], is_locked=body.is_locked)
     return {"ok": True}
-
-
-# Mount Apple MDM plist endpoints (no /api prefix, no JWT)
-app.include_router(mdm_plist_router)
 
 # Mount JSON MDM endpoints under /api
 app.include_router(mdm_router, prefix="/api")
