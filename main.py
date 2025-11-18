@@ -706,26 +706,144 @@ async def mdm_command(
 ):
     """
     Apple MDM command channel endpoint.
-    Device posts its Status; if Status == 'Idle', we may respond with a Command plist.
+
+    - Status = "Idle":
+        -> pop next PENDING command for this UDID and return a Command plist
+    - Status = "Acknowledged" or "Error":
+        -> update mdm_ios_command with result and error details
     """
     raw = await request.body()
     payload = _parse_plist_body(raw)
 
-    status   = payload.get("Status")       # "Idle" | "Acknowledged" | "Error" | ...
+    status   = payload.get("Status")        # "Idle", "Acknowledged", "Error", ...
     udid     = payload.get("UDID")
     cmd_uuid = payload.get("CommandUUID")
 
     print("[MDM][CMD] Status=", status, "UDID=", udid, "CommandUUID=", cmd_uuid)
 
-    # TODO:
-    #   - if status == "Idle":
-    #         fetch next pending command for this UDID from DB,
-    #         plistlib.dumps(...) and return it.
-    #   - else (Acknowledged/Error):
-    #         update command status in DB with payload details.
+    if not udid:
+        # Without UDID we can't map to a device – just return empty 200
+        return Response(content=b"", media_type="application/xml")
 
-    # For now: no command → empty 200
-    return Response(content=b"", media_type="application/xml")
+    now_utc = _now_utc()
+
+    with engine.begin() as conn:
+        # --- 1) Find device row ---
+        dev_row = conn.execute(text("""
+            SELECT id_mdm_ios_device
+              FROM numbux.mdm_ios_device
+             WHERE udid = :udid
+             LIMIT 1
+        """), {"udid": udid}).mappings().first()
+
+        device_id = dev_row["id_mdm_ios_device"] if dev_row else None
+
+        if device_id:
+            conn.execute(text("""
+                UPDATE numbux.mdm_ios_device
+                   SET last_seen_at   = :now,
+                       last_checkin_at = :now,
+                       updated_at      = :now
+                 WHERE id_mdm_ios_device = :id_dev
+            """), {"now": now_utc, "id_dev": device_id})
+
+        # --- 2) Status = Idle → send next PENDING command ---
+        if status == "Idle":
+            if not device_id:
+                return Response(content=b"", media_type="application/xml")
+
+            cmd = conn.execute(text("""
+                SELECT id_mdm_ios_command,
+                       command_uuid,
+                       request_type,
+                       payload_plist
+                  FROM numbux.mdm_ios_command
+                 WHERE id_mdm_ios_device = :id_dev
+                   AND status = 'PENDING'
+                 ORDER BY queued_at ASC, id_mdm_ios_command ASC
+                 LIMIT 1
+            """), {"id_dev": device_id}).mappings().first()
+
+            if not cmd:
+                # No pending commands
+                return Response(content=b"", media_type="application/xml")
+
+            # Mark as SENT
+            conn.execute(text("""
+                UPDATE numbux.mdm_ios_command
+                   SET status  = 'SENT',
+                       sent_at = :now
+                 WHERE id_mdm_ios_command = :cid
+            """), {"now": now_utc, "cid": cmd["id_mdm_ios_command"]})
+
+            # Build the Command plist
+            try:
+                cmd_payload = json.loads(cmd["payload_plist"])
+            except Exception:
+                cmd_payload = {"RequestType": cmd["request_type"]}
+
+            out_plist = {
+                "CommandUUID": str(cmd["command_uuid"]),
+                "Command": cmd_payload,
+            }
+            body = plistlib.dumps(out_plist)
+            return Response(
+                content=body,
+                media_type="application/x-apple-aspen-mdm",
+            )
+
+        # --- 3) Status = Acknowledged / Error → store result ---
+        if status in {"Acknowledged", "Error"} and device_id and cmd_uuid:
+            # Store full iOS response as JSON text
+            try:
+                result_json = json.dumps(payload)
+            except TypeError:
+                # If there are non-JSON-serializable bits (e.g. bytes),
+                # fall back to string repr so we don't 500.
+                result_json = str(payload)
+
+            error_code = None
+            error_chain_json = None
+
+            if status == "Error":
+                chain = payload.get("ErrorChain")
+                if chain is not None:
+                    try:
+                        error_chain_json = json.dumps(chain)
+                        if isinstance(chain, list) and chain:
+                            first = chain[0]
+                            if isinstance(first, dict):
+                                error_code = str(
+                                    first.get("ErrorCode")
+                                    or first.get("ErrorDomain")
+                                    or ""
+                                )
+                    except Exception:
+                        error_chain_json = None
+
+            # NOTE: no ::uuid cast; Postgres will cast from text automatically
+            conn.execute(text("""
+                UPDATE numbux.mdm_ios_command
+                   SET status          = :new_status,
+                       acknowledged_at = :now,
+                       result_plist    = :result_plist,
+                       error_code      = :error_code,
+                       error_chain     = :error_chain
+                 WHERE id_mdm_ios_device = :id_dev
+                   AND command_uuid       = :cmd_uuid
+            """), {
+                "new_status": "ACKNOWLEDGED" if status == "Acknowledged" else "ERROR",
+                "now": now_utc,
+                "result_plist": result_json,
+                "error_code": error_code,
+                "error_chain": error_chain_json,
+                "id_dev": device_id,
+                "cmd_uuid": str(cmd_uuid),
+            })
+
+        # Any other status → just 200 OK, empty body
+        return Response(content=b"", media_type="application/xml")
+
 
 
 # === FCM (server → device) ===
