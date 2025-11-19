@@ -438,12 +438,7 @@ def mdm_enroll_profile():
             "URL": "https://mdm.numbux.com/scep",
             "Name": "Numbux SCEP CA",
 
-            # Subject = [[[ "CN", "Numbux Device Identity" ]]]
-            "Subject": [
-                [
-                    ["CN", "Numbux Device Identity"]
-                ]
-            ],
+            # 🔥 REMOVE the Subject key for now
 
             "KeyType": "RSA",
             "Keysize": 2048,
@@ -511,7 +506,21 @@ def mdm_enroll_profile():
     )
 
 
-@mdm_plist_router.post("/mdm/checkin")
+@mdm_plist_router.api_route("/mdm/checkin", methods=["GET", "HEAD", "OPTIONS"])
+async def mdm_checkin_probe(request: Request):
+    """
+    Probe endpoint for iOS during profile installation.
+
+    iOS may do GET/HEAD/OPTIONS to the CheckInURL to verify the server.
+    We always return 200 OK with an empty XML body.
+    """
+    return Response(
+        content=b"",
+        media_type="application/xml",
+    )
+
+
+@mdm_plist_router.api_route("/mdm/checkin", methods=["POST", "PUT"])
 async def mdm_checkin(
     request: Request,
     client_cert = Depends(require_mdm_client_cert),
@@ -519,14 +528,8 @@ async def mdm_checkin(
     """
     Apple MDM check-in endpoint.
 
-    Handles:
-      - MessageType = "Authenticate"
-      - MessageType = "TokenUpdate"
-      - MessageType = "CheckOut"
-
-    Persists into:
-      - numbux.mdm_ios_device       (current device state per UDID)
-      - numbux.mdm_ios_checkin_log  (raw plist audit log)
+    iOS may use POST (standard) or PUT (some flows).
+    We treat them the same: plist body with MessageType, UDID, etc.
     """
     raw = await request.body()
     payload = _parse_plist_body(raw)
@@ -810,20 +813,6 @@ async def mdm_checkin(
 
     # Apple is happy with an empty 200 OK.
     return Response(content=b"", media_type="application/xml")
-
-
-@mdm_plist_router.get("/mdm/checkin")
-async def mdm_checkin_probe():
-    """
-    Probe endpoint for iOS during profile installation.
-
-    iOS may do a GET to the CheckInURL just to verify the server.
-    We return 200 OK with an empty (but valid) XML body.
-    """
-    return Response(
-        content=b"",               # empty body is fine
-        media_type="application/xml",
-    )
 
 
 @mdm_plist_router.head("/mdm/checkin")
