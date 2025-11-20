@@ -23,7 +23,7 @@ import re
 import smtplib
 from email.message import EmailMessage
 from uuid import uuid4
-
+import base64
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -412,57 +412,55 @@ def mdm_enroll_profile():
     """
     Downloadable .mobileconfig to enroll iOS into Numbux MDM.
     Root type: Configuration
+
     Includes:
-      - com.apple.security.scep payload (with nested PayloadContent)
-      - com.apple.mdm payload
+      - com.apple.security.pkcs12 payload (device identity certificate)
+      - com.apple.mdm payload (device MDM channel)
     """
 
-    org_name = "Numbux"
+    org_name = APPLE_MDM_ORG        # e.g. "Numbux"
     base_id  = "com.numbux.mdm"
-    enroll_id = "default"   # later you can vary per-center, etc.
+    enroll_id = "default"
 
-    # === SCEP payload ===
-    scep_payload_uuid = str(uuid4())
-    scep_name = "Numbux MDM Identity"
+    # === Load PKCS#12 from env (base64) ===
+    p12_b64 = must_get("APPLE_MDM_P12_BASE64")
+    p12_bytes = base64.b64decode(p12_b64)
+    p12_password = os.getenv("APPLE_MDM_P12_PASSWORD", "NumbuxP12Pass123!")
 
-    scep_payload = {
-        "PayloadType": "com.apple.security.scep",
+    # === PKCS#12 identity payload ===
+    pkcs_payload_uuid = str(uuid4())
+    pkcs_payload = {
+        "PayloadType": "com.apple.security.pkcs12",
         "PayloadVersion": 1,
-        "PayloadIdentifier": f"{base_id}.scep.{enroll_id}",
-        "PayloadUUID": scep_payload_uuid,
-        "PayloadDisplayName": scep_name,
-        "PayloadDescription": "Certificado de identidad para Numbux MDM (vía SCEP).",
+        "PayloadIdentifier": f"{base_id}.identity.{enroll_id}",
+        "PayloadUUID": pkcs_payload_uuid,
+        "PayloadDisplayName": "Numbux MDM Identity",
+        "PayloadDescription": "Certificado de identidad para Numbux MDM (PKCS#12 embebido).",
+        "PayloadOrganization": org_name,
 
-        # 👇 SCEP-specific settings MUST be inside this inner PayloadContent
-        "PayloadContent": {
-            "URL": "https://mdm.numbux.com/scep",
-            "Name": "Numbux SCEP CA",
+        # Password to unlock the pkcs12
+        "Password": p12_password,
 
-            # 🔥 REMOVE the Subject key for now
-
-            "KeyType": "RSA",
-            "Keysize": 2048,
-            "KeyUsage": 0,   # digitalSignature + keyEncipherment
-            "Retries": 3,
-            "RetryDelay": 10,
-
-            # Must match the -challenge you used for scepserver
-            "Challenge": "numbux-secret",
-        },
+        # Raw PKCS#12 bytes → plistlib will encode as <data>...</data>
+        "PayloadContent": p12_bytes,
     }
 
     # === MDM payload ===
     mdm_payload_uuid = str(uuid4())
     checkin_url = "https://mdm.numbux.com/mdm/checkin"
     command_url = "https://mdm.numbux.com/mdm/command"
-    topic = "com.apple.mgmt.External.c4a94ee1-7fbe-4ead-8d24-4b6675d3981f"   # MUST match your APNs MDM topic
+
+    topic = os.getenv(
+        "APPLE_MDM_TOPIC",
+        "com.apple.mgmt.External.f53319ba-1fff-450f-8ab9-a1e8807b48f0",
+    )
 
     mdm_payload = {
         "PayloadType": "com.apple.mdm",
         "PayloadVersion": 1,
         "PayloadIdentifier": f"{base_id}.device.{enroll_id}",
         "PayloadUUID": mdm_payload_uuid,
-        "PayloadDisplayName": "Numbux Device Management",
+        "PayloadDisplayName": APPLE_MDM_MDM_NAME,
         "PayloadDescription": "Inscripción del dispositivo en Numbux MDM.",
         "PayloadOrganization": org_name,
 
@@ -471,9 +469,10 @@ def mdm_enroll_profile():
         "Topic": topic,
         "SignMessage": True,
         "CheckOutWhenRemoved": True,
-        "IdentityCertificateUUID": scep_payload_uuid,
 
-        # For now give it everything; we can tune later
+        # 👇 Now reference the PKCS#12 identity payload, not SCEP
+        "IdentityCertificateUUID": pkcs_payload_uuid,
+
         "AccessRights": 8191,
         "ServerCapabilities": ["com.apple.mdm.per-user-connections"],
     }
@@ -484,14 +483,14 @@ def mdm_enroll_profile():
         "PayloadVersion": 1,
         "PayloadIdentifier": f"{base_id}.enroll.{enroll_id}",
         "PayloadUUID": str(uuid4()),
-        "PayloadDisplayName": "Numbux MDM Enrollment",
+        "PayloadDisplayName": APPLE_MDM_PROFILE_NAME,
         "PayloadDescription": (
             "Perfil para inscribir este dispositivo en Numbux MDM "
             "y permitir el control de apps en el aula."
         ),
         "PayloadOrganization": org_name,
         "PayloadContent": [
-            scep_payload,
+            pkcs_payload,
             mdm_payload,
         ],
     }
@@ -504,6 +503,7 @@ def mdm_enroll_profile():
             "Content-Disposition": 'attachment; filename="NumbuxMDM.mobileconfig"'
         },
     )
+
 
 
 @mdm_plist_router.api_route("/mdm/checkin", methods=["GET", "HEAD", "OPTIONS"])

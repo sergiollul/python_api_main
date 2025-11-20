@@ -17,3 +17,7 @@ Run the script using the API’s virtualenv Python
 sudo pkill -f "/opt/numbux_api/venv/bin/uvicorn"
 sudo systemctl restart numbux.service
 sudo systemctl restart numbux-api.service
+
+
+cd /srv/numbux-api
+curl -v http://127.0.0.1:8000/mdm/enroll/profile -o NumbuxMDM.mobileconfig
