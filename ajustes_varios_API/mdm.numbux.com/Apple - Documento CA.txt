@@ -1,0 +1,218 @@
+Yep, what’s happening is:
+
+All those scep_linux_amd64.tar.gz files you’re downloading are not real tarballs – they’re just a tiny text response from GitHub saying Not Found, which is why:
+
+file scep_linux_amd64.tar.gz
+# ASCII text, with no line terminators
+
+hexdump -C scep_linux_amd64.tar.gz
+# 4e 6f 74 20 46 6f 75 6e 64   => "Not Found"
+
+
+So tar is right to complain: there’s nothing to extract.
+
+Option A (simplest right now): use the Debian scepserver you already installed
+
+You already have a SCEP implementation installed:
+
+dpkg -L scep
+# /usr/bin/scepclient
+# /usr/bin/scepserver
+
+
+So you can completely forget about GitHub tarballs for now.
+
+Next steps:
+
+Check the help / manpage for the Debian scepserver:
+
+scepserver --help
+# or
+man scepserver
+
+
+You’re looking for options like:
+
+where to store the CA (“depot” / DB / directory)
+
+how to initialise the CA
+
+what port & URL it serves (e.g. /cgi-bin/pkiclient.exe or /scep)
+
+Create a CA directory, for example:
+
+mkdir -p /opt/scep-ca
+
+
+Initialize the CA using the syntax shown in scepserver --help
+(something like “init CA”, “createca”, or similar – the exact flag names depend on that package).
+
+Run scepserver bound to an HTTP URL that matches the SCEP URL you put in your .mobileconfig.
+For example, if our profile uses:
+
+<key>URL</key>
+<string>https://mdm.numbux.com/scep</string>
+
+
+then we’ll either:
+
+run scepserver directly on port 80/443 with that path, or
+
+run it on some internal port (e.g. localhost:2016) and reverse-proxy /scep from Apache/Nginx → scepserver.
+
+
+1️⃣ Initialize the SCEP CA
+
+We’ll put the CA in /opt/scep-ca:
+
+sudo mkdir -p /opt/scep-ca
+cd /opt/scep-ca
+
+# Initialize the CA
+sudo scepserver ca -init -depot /opt/scep-ca
+
+
+It will ask you things like subject, etc. For example you can answer:
+
+CN: Numbux SCEP CA
+
+O: Numbux
+
+C: ES (or your country)
+
+After that, check what got created:
+
+ls -lh /opt/scep-ca
+
+
+You should see things like: ca.pem, ca.key, maybe index.txt, serial, etc.
+
+👉 ca.pem is the CA cert that will sign device identity certificates.
+
+2️⃣ Run the SCEP server (test mode)
+
+Let’s first run it in the foreground to be sure it works:
+
+cd /opt/scep-ca
+
+sudo scepserver \
+  -depot /opt/scep-ca \
+  -port 2016 \
+  -challenge="numbux-secret" \
+  -debug
+
+
+Listens on http://127.0.0.1:2016/scep
+
+-challenge is the SCEP password (we can later put the same challenge into the mobileconfig SCEP payload).
+
+Open another SSH session and test:
+
+curl "http://127.0.0.1:2016/scep?operation=GetCACert" -o /tmp/scep_ca.der
+file /tmp/scep_ca.der
+
+
+If that returns some DER data (not HTML), SCEP is alive ✅
+
+Later, we’ll daemonize this with a systemd service, but for now foreground + -debug is good to verify.
+
+
+
+
+✅ STEP 1 — Add NGINX proxy for /scep
+
+Run this:
+
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost_nginx.conf << "EOF"
+# Serve SCEP endpoint
+location /scep {
+    proxy_pass http://127.0.0.1:2016;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+}
+EOF'
+
+
+📌 This file must replace your old vhost_nginx.conf, not append to it.
+
+If you want to preserve your existing config, tell me and I will merge them manually — but since you said /mdm.numbux.com is exclusively for MDM, this is safe.
+
+✅ STEP 2 — Add Apache proxies for /scep
+HTTP:
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost.conf << "EOF"
+ProxyPass        /scep http://127.0.0.1:2016/scep
+ProxyPassReverse /scep http://127.0.0.1:2016/scep
+EOF'
+
+HTTPS:
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost_ssl.conf << "EOF"
+ProxyPass        /scep http://127.0.0.1:2016/scep
+ProxyPassReverse /scep http://127.0.0.1:2016/scep
+EOF'
+
+✅ STEP 3 — Reload Plesk web config
+sudo plesk repair web mdm.numbux.com -y
+
+
+If you get warnings but no errors → OK.
+
+✅ STEP 4 — TEST from the server (IMPORTANT)
+
+Now test:
+
+curl -k "https://mdm.numbux.com/scep?operation=GetCACert" -o /tmp/NumbuxSCEP.der
+file /tmp/NumbuxSCEP.der
+
+
+You should see:
+
+/tmp/NumbuxSCEP.der: Certificate, Version=3 ...
+
+
+If yes → your iPhone can now request SCEP certificates.
+
+If no, paste the output here and I’ll fix it.
+
+📱 AFTER /scep WORKS
+
+You will now be able to:
+
+✅ Install NumbuxMDM.mobileconfig
+➡️ iPhone will hit /scep
+➡️ Your SCEP server issues a cert
+➡️ iPhone uses that cert to authenticate to /mdm/checkin
+➡️ Enrollment continues
+➡️ Commands start working
+
+
+Where you are now (big picture)
+
+For iOS MDM, you now have:
+
+Enrollment profile endpoint
+GET https://mdm.numbux.com/mdm/enroll/profile
+→ returns a .mobileconfig with:
+
+SCEP payload pointing to https://mdm.numbux.com/scep
+
+MDM payload pointing to https://mdm.numbux.com/mdm/checkin and /mdm/command
+
+SCEP server
+
+URL: https://mdm.numbux.com/scep
+
+Backed by /opt/scep-ca and scepserver -depot /opt/scep-ca -port 2016 -challenge "numbux-secret"
+
+MDM server endpoints in FastAPI:
+
+POST /mdm/checkin – handles Authenticate, TokenUpdate, CheckOut
+
+POST /mdm/command – handles Status=Idle and returns commands from DB
+
+So the whole server-side enrollment flow is wired.
+
+
+

@@ -1,0 +1,111 @@
+🧱 STEP 1 — Create project folder
+sudo mkdir -p /srv/numbux-api/app
+sudo chown -R $USER:$USER /srv/numbux-api
+cd /srv/numbux-api
+
+🧩 STEP 2 — Create virtual environment and install dependencies
+python3 -m venv .venv
+source .venv/bin/activate
+pip install fastapi "uvicorn[standard]" sqlalchemy psycopg2-binary pydantic
+
+⚙️ STEP 3 — Create environment file for DB connection
+
+Replace user, password, and dbname with your actual PostgreSQL credentials.
+
+cat > /srv/numbux-api/.env <<'ENV'
+export DATABASE_URL='postgresql+psycopg2://numbux:Sergio%401234@localhost:5432/numbux'
+ENV
+
+
+🧩 1️⃣ Create the app directory and file
+mkdir -p /srv/numbux-api/app
+nano /srv/numbux-api/app/main.py
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import create_engine, text
+import os
+from dotenv import load_dotenv
+load_dotenv("/srv/numbux-api/.env")
+
+# === Load DB connection ===
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://user:Sergio%401234@localhost:5432/numbux")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+# === Create the app ===
+app = FastAPI(title="Numbux API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# === Request model ===
+class EmailRequest(BaseModel):
+    email: EmailStr
+
+# === Endpoint ===
+@app.post("/check_email")
+def check_email(payload: EmailRequest):
+    """Check if email exists in profesores or alumnos."""
+    query = text("""
+        SELECT 'profesor' AS tipo FROM profesores WHERE lower(correo) = :email
+        UNION ALL
+        SELECT 'alumno' AS tipo FROM alumnos WHERE lower(correo) = :email
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        result = conn.execute(query, {"email": payload.email.lower()}).mappings().first()
+        if not result:
+            raise HTTPException(status_code=404, detail="Email not found")
+        return {"exists": True, "tipo": result["tipo"]}
+
+
+
+▶️ 2️⃣ Run the API server
+pip install "pydantic[email]"
+
+▶️ 2️⃣ Run the API server
+cd /srv/numbux-api
+source .venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+🧪 Test again
+
+In another terminal:
+
+curl -s http://127.0.0.1:8000/check_email \
+  -H "Content-Type: application/json" \
+  -d '{"email":"profesor1234@profe.com"}'
+
+
+✅ Expected:
+
+{"exists": true, "tipo": "profesor"}
+
+
+
+
+======================================
+--- ✅ Resumen ✅ ---
+======================================
+
+API FastAPI funcional
+Ubicación: /srv/numbux-api/app/main.py
+Endpoint operativo:
+
+POST /check_email
+body: {"email": "profesor1234@profe.com"}
+
+
+Respuesta esperada:
+
+{"exists": true, "tipo": "profesor"}
+
+
+Conexión a PostgreSQL establecida correctamente
+Usuario: numbux
+Base: numbux

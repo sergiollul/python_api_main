@@ -1,0 +1,141 @@
+1) (Si no existe) crea el dominio principal en Plesk
+
+Salta este paso si ya ves numbux.com en Plesk GUI.
+
+sudo plesk bin domain --create numbux.com -ip 217.154.188.157 -www true
+
+2) Activa los módulos proxy en Apache
+sudo a2enmod proxy proxy_http headers
+sudo systemctl reload apache2
+
+3) Crea el vhost HTTP para api.numbux.com (proxy → 127.0.0.1:8000)
+sudo bash -c 'cat > /etc/apache2/sites-available/api.numbux.com.conf <<APACHE
+<VirtualHost *:80>
+    ServerName api.numbux.com
+
+    ProxyPreserveHost On
+    ProxyPass        / http://127.0.0.1:8000/
+    ProxyPassReverse / http://127.0.0.1:8000/
+
+    RequestHeader set X-Forwarded-Proto "http"
+    RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+    ErrorLog \${APACHE_LOG_DIR}/api.numbux.com_error.log
+    CustomLog \${APACHE_LOG_DIR}/api.numbux.com_access.log combined
+</VirtualHost>
+APACHE'
+
+sudo a2ensite api.numbux.com
+sudo apachectl configtest && sudo systemctl reload apache2
+
+-----
+Prueba HTTP:
+
+curl -s http://api.numbux.com/check_email \
+  -H "Content-Type: application/json" \
+  -d '{"email":"profesor1234@profe.com"}'
+
+
+Deberías ver JSON. Si sí, seguimos con HTTPS.
+
+-----------------------
+
+1) Update Plesk includes (HTTP + HTTPS) to use the vhost webroot
+# HTTP include
+sudo bash -c 'cat > /var/www/vhosts/system/api.numbux.com/conf/vhost.conf <<APACHE
+# Exclude ACME from proxy and serve from the vhost webroot
+ProxyPass /.well-known/acme-challenge/ !
+Alias /.well-known/acme-challenge/ /var/www/vhosts/numbux.com/api/.well-known/acme-challenge/
+<Directory "/var/www/vhosts/numbux.com/api/.well-known/acme-challenge/">
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>
+
+# Proxy everything else to FastAPI
+ProxyPreserveHost On
+ProxyPass        / http://127.0.0.1:8000/
+ProxyPassReverse / http://127.0.0.1:8000/
+RequestHeader set X-Forwarded-Proto "http"
+RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+APACHE'
+
+# HTTPS include
+sudo bash -c 'cat > /var/www/vhosts/system/api.numbux.com/conf/vhost_ssl.conf <<APACHE
+# Exclude ACME from proxy and serve from the vhost webroot (HTTPS too)
+ProxyPass /.well-known/acme-challenge/ !
+Alias /.well-known/acme-challenge/ /var/www/vhosts/numbux.com/api/.well-known/acme-challenge/
+<Directory "/var/www/vhosts/numbux.com/api/.well-known/acme-challenge/">
+    Options None
+    AllowOverride None
+    Require all granted
+</Directory>
+
+# Proxy everything else to FastAPI
+ProxyPreserveHost On
+ProxyPass        / http://127.0.0.1:8000/
+ProxyPassReverse / http://127.0.0.1:8000/
+RequestHeader set X-Forwarded-Proto "https"
+RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+APACHE'
+
+(Optional but good) Nginx include too
+sudo bash -c 'cat > /var/www/vhosts/system/api.numbux.com/conf/vhost_nginx.conf <<NGINX
+# Serve ACME from the vhost webroot
+location ^~ /.well-known/acme-challenge/ {
+    root /var/www/vhosts/numbux.com/api;
+    try_files \$uri =404;
+}
+
+# Proxy to FastAPI
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+}
+NGINX'
+
+
+Apply:
+
+sudo plesk repair web api.numbux.com -y
+
+2) Create the ACME folder where Plesk expects it (vhost webroot)
+sudo mkdir -p /var/www/vhosts/numbux.com/api/.well-known/acme-challenge
+# set ownership to the system user of the subscription (from your info: numbuxsys)
+sudo chown -R numbuxsys:psacln /var/www/vhosts/numbux.com/api/.well-known
+
+
+Sanity test:
+
+echo OK | sudo -u numbuxsys tee /var/www/vhosts/numbux.com/api/.well-known/acme-challenge/test >/dev/null
+
+# HTTP likely 301 → fine
+curl -I http://api.numbux.com/.well-known/acme-challenge/test
+
+# HTTPS must return: OK
+curl -sk https://api.numbux.com/.well-known/acme-challenge/test
+
+
+If you don’t see OK on HTTPS, stop and tell me.
+
+3) Issue a real Let’s Encrypt cert via Plesk
+sudo plesk bin extension --exec letsencrypt cli.php \
+  -d api.numbux.com \
+  -m info@numbux.com --agree-tos --force
+
+
+This time validation should succeed.
+
+4) Verify and call your API (no -k)
+openssl s_client -connect api.numbux.com:443 -servername api.numbux.com </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer
+
+curl -i -X POST https://api.numbux.com/check_email \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"profesor1234@profe.com"}'
+
+
+You should get a trusted cert and a 200 OK JSON response.

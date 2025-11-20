@@ -1,0 +1,47 @@
+2) Crea el servicio systemd
+
+sudo bash -c 'cat > /etc/systemd/system/numbux.service <<SERVICE
+[Unit]
+Description=Numbux FastAPI
+After=network.target
+
+[Service]
+WorkingDirectory=/srv/numbux-api
+EnvironmentFile=/srv/numbux-api/.env
+ExecStart=/srv/numbux-api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SERVICE'
+
+
+------
+Nota: usamos EnvironmentFile para que coja tu DATABASE_URL (con %40) sin problemas.
+------
+
+
+3) Activa y arranca el servicio
+sudo systemctl daemon-reload
+sudo systemctl enable --now numbux
+sudo systemctl status numbux --no-pager
+
+-----
+Deberías ver active (running).
+-----
+
+
+
+🧭 Resumen rápido de tu entorno actual
+Componente	Estado
+🐍 Python (FastAPI)	✅ /srv/numbux-api/app/main.py funcionando
+🗃️ PostgreSQL	✅ conexión estable como usuario numbux
+🔁 Systemd	✅ servicio activo numbux.service (autoarranca tras reinicio)
+🔌 Endpoint	✅ POST /check_email responde correctamente
+
+
+
+
+
+

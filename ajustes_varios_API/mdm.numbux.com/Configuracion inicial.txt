@@ -1,0 +1,278 @@
+✅ 1. Create the subdomain
+
+Run:
+
+plesk bin subdomain --create mdm -domain numbux.com
+
+
+If successful, Plesk will create:
+
+/var/www/vhosts/system/mdm.numbux.com/
+
+
+and Apache + nginx will have configs for it.
+
+You can check:
+
+ls /var/www/vhosts/system/
+
+
+You should now see:
+
+api.numbux.com/
+mdm.numbux.com/
+
+✅ 2. Issue the Let’s Encrypt certificate for this new subdomain
+
+Plesk has its own LE extension. Use:
+
+plesk bin extension --exec letsencrypt cli.php \
+  -d mdm.numbux.com \
+  -m info@numbux.com \
+  --agree-tos --force
+
+
+If ACME validation succeeds, SSL is installed automatically.
+
+Test:
+
+curl -I https://mdm.numbux.com
+
+
+You should get a 200/301/403 from Plesk — that’s normal.
+
+Now HTTPS works.
+
+
+
+
+
+✅ 3. Add the nginx include for proxy + MDM client-cert headers
+
+Create:
+
+nano /var/www/vhosts/system/mdm.numbux.com/conf/vhost_nginx.conf
+
+
+Put this:
+
+# Accept client certificates even without CA (for now)
+ssl_verify_client optional_no_ca;
+# Later switch to:
+# ssl_verify_client optional;
+# ssl_client_certificate /etc/numbux-mdm/Apple_MDM_CA.pem;
+
+location / {
+    proxy_pass http://127.0.0.1:8000;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Forward client-cert info to FastAPI
+    proxy_set_header X-SSL-Client-Verify    $ssl_client_verify;
+    proxy_set_header X-SSL-Client-Subject-DN $ssl_client_s_dn;
+    proxy_set_header X-SSL-Client-Serial     $ssl_client_serial;
+}
+
+
+Apply changes:
+
+plesk repair web mdm.numbux.com -y
+
+
+
+
+✅ 4. Test proxy
+
+Run:
+
+curl -sk https://mdm.numbux.com/me
+
+
+You should see a FastAPI JSON error:
+
+{"detail": "Not authenticated"}
+
+
+That’s perfect — it means:
+
+mdm.numbux.com → Plesk nginx → Apache proxy → FastAPI (uvicorn) is working.
+
+
+
+
+
+
+---------------------------------------------
+1. Create the Plesk include files for mdm.numbux.com
+
+Run these commands:
+
+sudo mkdir -p /var/www/vhosts/system/mdm.numbux.com/conf
+
+Apache HTTP (port 80)
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost.conf <<APACHE
+ProxyPreserveHost On
+ProxyPass        / http://127.0.0.1:8000/
+ProxyPassReverse / http://127.0.0.1:8000/
+
+RequestHeader set X-Forwarded-Proto "http"
+RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+APACHE'
+
+Apache HTTPS (port 443)
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost_ssl.conf <<APACHE
+ProxyPreserveHost On
+ProxyPass        / http://127.0.0.1:8000/
+ProxyPassReverse / http://127.0.0.1:8000/
+
+RequestHeader set X-Forwarded-Proto "https"
+RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+APACHE'
+
+Nginx (front-end proxy)
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost_nginx.conf <<NGINX
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+}
+NGINX'
+
+
+🔎 Note: for now I’m not enabling ssl_verify_client here; we’ll add the Apple MDM CA + client-cert verification once basic routing works.
+
+
+
+Let’s wire mdm.numbux.com → FastAPI + SCEP again at the web-server level.
+
+1️⃣ Quick sanity check: FastAPI is OK
+
+Just to be sure the backend endpoint is alive on localhost:
+
+curl -s http://127.0.0.1:8000/mdm/enroll/profile -o /tmp/local_enroll.mobileconfig
+file /tmp/local_enroll.mobileconfig
+
+
+You should see something like XML 1.0 document.
+If that’s true, backend is fine — the problem is only Apache/nginx routing.
+
+2️⃣ Re-create Apache includes for mdm.numbux.com
+
+These will make Apache proxy everything for that vhost to:
+
+/scep → SCEP server on 127.0.0.1:2016
+
+everything else (/) → FastAPI on 127.0.0.1:8000
+
+Run this exactly:
+
+sudo mkdir -p /var/www/vhosts/system/mdm.numbux.com/conf
+
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost.conf << "APACHE"
+ProxyPreserveHost On
+
+# SCEP (HTTP) → scepserver
+ProxyPass        /scep http://127.0.0.1:2016/scep
+ProxyPassReverse /scep http://127.0.0.1:2016/scep
+
+# Everything else → FastAPI (HTTP)
+ProxyPass        / http://127.0.0.1:8000/
+ProxyPassReverse / http://127.0.0.1:8000/
+
+RequestHeader set X-Forwarded-Proto "http"
+RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+APACHE'
+
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost_ssl.conf << "APACHE"
+ProxyPreserveHost On
+
+# SCEP (HTTPS goes to same backend)
+ProxyPass        /scep http://127.0.0.1:2016/scep
+ProxyPassReverse /scep http://127.0.0.1:2016/scep
+
+# Everything else → FastAPI
+ProxyPass        / http://127.0.0.1:8000/
+ProxyPassReverse / http://127.0.0.1:8000/
+
+RequestHeader set X-Forwarded-Proto "https"
+RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+APACHE'
+
+
+Apply them:
+
+sudo plesk repair web mdm.numbux.com -y
+sudo systemctl reload apache2
+
+3️⃣ (Optional but good) Nginx include
+
+If nginx is enabled as reverse proxy in Plesk (usual), keep it in sync so nginx also knows about /scep:
+
+sudo bash -c 'cat > /var/www/vhosts/system/mdm.numbux.com/conf/vhost_nginx.conf << "NGINX"
+location /scep {
+    proxy_pass http://127.0.0.1:2016;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+}
+
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+}
+NGINX'
+
+sudo plesk repair web mdm.numbux.com -y
+sudo systemctl reload nginx
+
+
+If nginx is disabled, that file just sits there and does nothing — no problem.
+
+4️⃣ Test from outside
+
+Now test both paths again:
+
+a) Enrollment profile
+curl -k https://mdm.numbux.com/mdm/enroll/profile -i -o /tmp/NumbuxMDM.mobileconfig
+file /tmp/NumbuxMDM.mobileconfig
+
+
+You want to see:
+
+HTTP/1.1 200 OK
+
+Content-Type: application/x-apple-aspen-config
+
+file → XML 1.0 document, ASCII text
+
+b) SCEP CA
+curl -k "https://mdm.numbux.com/scep?operation=GetCACert" -o /tmp/NumbuxSCEP.der
+file /tmp/NumbuxSCEP.der
+
+
+You should see something like:
+
+Certificate, Version=3 (same as when you hit http://127.0.0.1:2016/... directly).
+
+Once both of those succeed, you’re back to:
+
+✅ Profile generation endpoint working behind mdm.numbux.com
+
+✅ SCEP reachable on /scep
+
+At that point you can try enrolling the iPhone again with the .mobileconfig you download from the real URL.
