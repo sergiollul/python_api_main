@@ -825,7 +825,7 @@ async def mdm_checkin_head():
 
 
 
-@mdm_plist_router.post("/mdm/command")
+@mdm_plist_router.api_route("/mdm/command", methods=["POST", "PUT"])
 async def mdm_command(
     request: Request,
     client_cert = Depends(require_mdm_client_cert),
