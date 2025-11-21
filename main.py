@@ -1003,8 +1003,6 @@ async def mdm_command(
 app.include_router(mdm_plist_router)
 
 
-
-
 def load_profile_base64(path: str) -> str:
     """
     Reads a .mobileconfig profile from disk and returns base64 string
@@ -1012,6 +1010,162 @@ def load_profile_base64(path: str) -> str:
     """
     data = Path(path).read_bytes()
     return base64.b64encode(data).decode("ascii")
+
+
+def build_app_lock_profile_bytes(bundle_id: str) -> bytes:
+    """
+    Build a minimal com.apple.app.lock profile for the given bundle_id.
+    Returns raw .mobileconfig bytes (XML plist) suitable for InstallProfile.
+    """
+    profile = {
+        "PayloadType": "Configuration",
+        "PayloadVersion": 1,
+        "PayloadIdentifier": "com.numbux.applock.profile",  # used for RemoveProfile
+        "PayloadUUID": "11111111-1111-1111-1111-111111111111",
+        "PayloadDisplayName": "Numbux – Single App Mode",
+        "PayloadOrganization": APPLE_MDM_ORG,
+        "PayloadContent": [
+            {
+                "PayloadType": "com.apple.app.lock",
+                "PayloadVersion": 1,
+                "PayloadIdentifier": "com.numbux.applock.payload",
+                "PayloadUUID": "22222222-2222-2222-2222-222222222222",
+                "PayloadDisplayName": "App Lock",
+                "App": {
+                    "Identifier": bundle_id,
+                },
+            }
+        ],
+    }
+    return plistlib.dumps(profile)
+
+class SingleAppModeRequest(BaseModel):
+    device_id: int
+    bundle_id: str = "com.apple.mobilesafari"  # default: Safari
+    enable: bool = True  # True = lock, False = unlock
+
+
+@app.post("/api/ios/single-app-mode")
+def api_single_app_mode(body: SingleAppModeRequest):
+    """
+    Enable or disable Single App Mode (App Lock) for a given iOS MDM device.
+
+    - enable = True  -> queue a single InstallProfile (dedup old RemoveProfile)
+    - enable = False -> queue a single RemoveProfile (dedup old InstallProfile)
+
+    The actual execution may be delayed until the device is unlocked;
+    NotNow responses are re-queued by /mdm/command.
+    """
+    device_id = body.device_id
+    desired_enable = body.enable
+    bundle_id = body.bundle_id
+
+    with engine.begin() as conn:
+        # 1) Ensure device exists
+        dev = conn.execute(text("""
+            SELECT id_mdm_ios_device
+              FROM numbux.mdm_ios_device
+             WHERE id_mdm_ios_device = :id
+        """), {"id": device_id}).mappings().first()
+        if not dev:
+            raise HTTPException(status_code=404, detail="MDM device not found")
+
+        # 2) Cancel opposite-type PENDING commands so we don't fight ourselves
+        if desired_enable:
+            # We want to LOCK → cancel old PENDING RemoveProfile
+            conn.execute(text("""
+                UPDATE numbux.mdm_ios_command
+                   SET status = 'ACKNOWLEDGED'
+                 WHERE id_mdm_ios_device = :dev_id
+                   AND request_type = 'RemoveProfile'
+                   AND status = 'PENDING'
+            """), {"dev_id": device_id})
+        else:
+            # We want to UNLOCK → cancel old PENDING InstallProfile
+            conn.execute(text("""
+                UPDATE numbux.mdm_ios_command
+                   SET status = 'ACKNOWLEDGED'
+                 WHERE id_mdm_ios_device = :dev_id
+                   AND request_type = 'InstallProfile'
+                   AND status = 'PENDING'
+            """), {"dev_id": device_id})
+
+        # 3) If there is already a PENDING command of the right type, reuse it
+        pending_same = conn.execute(text("""
+            SELECT id_mdm_ios_command, command_uuid
+              FROM numbux.mdm_ios_command
+             WHERE id_mdm_ios_device = :dev_id
+               AND request_type = :rtype
+               AND status = 'PENDING'
+             ORDER BY queued_at ASC, id_mdm_ios_command ASC
+             LIMIT 1
+        """), {
+            "dev_id": device_id,
+            "rtype": "InstallProfile" if desired_enable else "RemoveProfile",
+        }).mappings().first()
+
+        if pending_same:
+            # Idempotent: we already have the right kind of command queued
+            return {
+                "status": "queued",
+                "command_uuid": str(pending_same["command_uuid"]),
+                "request_type": "InstallProfile" if desired_enable else "RemoveProfile",
+                "device_id": device_id,
+                "note": "reused existing pending command",
+            }
+
+        # 4) No PENDING of desired type → create a new one
+        cmd_uuid = str(uuid4())
+
+        if desired_enable:
+            # Build app lock profile for the chosen bundle_id
+            profile_bytes = build_app_lock_profile_bytes(bundle_id)
+            profile_b64 = base64.b64encode(profile_bytes).decode("ascii")
+
+            payload = {
+                "RequestType": "InstallProfile",
+                "Payload": profile_b64,
+            }
+            request_type = "InstallProfile"
+        else:
+            # Remove the App Lock profile we installed above
+            payload = {
+                "RequestType": "RemoveProfile",
+                "Identifier": "com.numbux.applock.profile",
+            }
+            request_type = "RemoveProfile"
+
+        payload_json = json.dumps(payload)
+
+        conn.execute(text("""
+            INSERT INTO numbux.mdm_ios_command
+                (id_mdm_ios_device,
+                 command_uuid,
+                 request_type,
+                 payload_plist,
+                 status,
+                 queued_at)
+            VALUES
+                (:dev_id,
+                 :cmd_uuid,
+                 :rtype,
+                 :payload_plist,
+                 'PENDING',
+                 NOW())
+        """), {
+            "dev_id": device_id,
+            "cmd_uuid": cmd_uuid,
+            "rtype": request_type,
+            "payload_plist": payload_json,
+        })
+
+    return {
+        "status": "queued",
+        "command_uuid": cmd_uuid,
+        "request_type": request_type,
+        "device_id": device_id,
+        "note": "new command queued",
+    }
 
 
 
