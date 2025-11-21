@@ -25,6 +25,7 @@ from email.message import EmailMessage
 from uuid import uuid4
 import base64
 from pathlib import Path
+from mdm_push_apns import send_mdm_push_for_device
 
 
 ENV_PATH = "/srv/numbux-api/.env"
@@ -1159,12 +1160,21 @@ def api_single_app_mode(body: SingleAppModeRequest):
             "payload_plist": payload_json,
         })
 
+    # After queueing, trigger APNs push immediately
+    push_ok = True
+    try:
+        send_mdm_push_for_device(device_id)
+    except Exception as e:
+        push_ok = False
+        print("[MDM][PUSH][ERROR]", e)
+
     return {
         "status": "queued",
         "command_uuid": cmd_uuid,
         "request_type": request_type,
         "device_id": device_id,
         "note": "new command queued",
+        "push_triggered": push_ok,
     }
 
 
