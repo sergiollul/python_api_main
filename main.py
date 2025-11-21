@@ -24,6 +24,8 @@ import smtplib
 from email.message import EmailMessage
 from uuid import uuid4
 import base64
+from pathlib import Path
+
 
 ENV_PATH = "/srv/numbux-api/.env"
 load_dotenv(ENV_PATH)
@@ -903,29 +905,37 @@ async def mdm_command(
             """), {"now": now_utc, "cid": cmd["id_mdm_ios_command"]})
 
             # Build the Command plist
+            import base64 as _b64
+
             try:
                 cmd_payload = json.loads(cmd["payload_plist"])
             except Exception:
                 cmd_payload = {"RequestType": cmd["request_type"]}
+
+            # 🔥 Special handling for InstallProfile:
+            # Payload in DB is base64 STRING, but Apple wants raw bytes (<data>...</data>)
+            if cmd_payload.get("RequestType") == "InstallProfile":
+                p_b64 = cmd_payload.get("Payload")
+                if isinstance(p_b64, str):
+                    cmd_payload["Payload"] = _b64.b64decode(p_b64)
 
             out_plist = {
                 "CommandUUID": str(cmd["command_uuid"]),
                 "Command": cmd_payload,
             }
             body = plistlib.dumps(out_plist)
+
             return Response(
                 content=body,
                 media_type="application/x-apple-aspen-mdm",
             )
 
-        # --- 3) Status = Acknowledged / Error → store result ---
+        # --- 3) Status = Acknowledged / Error / NotNow ---
         if status in {"Acknowledged", "Error"} and device_id and cmd_uuid:
             # Store full iOS response as JSON text
             try:
                 result_json = json.dumps(payload)
             except TypeError:
-                # If there are non-JSON-serializable bits (e.g. bytes),
-                # fall back to string repr so we don't 500.
                 result_json = str(payload)
 
             error_code = None
@@ -947,7 +957,6 @@ async def mdm_command(
                     except Exception:
                         error_chain_json = None
 
-            # NOTE: no ::uuid cast; Postgres will cast from text automatically
             conn.execute(text("""
                 UPDATE numbux.mdm_ios_command
                    SET status          = :new_status,
@@ -967,12 +976,44 @@ async def mdm_command(
                 "cmd_uuid": str(cmd_uuid),
             })
 
+        elif status == "NotNow" and device_id and cmd_uuid:
+            # 🔁 Requeue + log what iOS sent
+            try:
+                result_json = json.dumps(payload)
+            except TypeError:
+                result_json = str(payload)
+
+            conn.execute(text("""
+                UPDATE numbux.mdm_ios_command
+                   SET status       = 'PENDING',
+                       result_plist = :result_plist
+                 WHERE id_mdm_ios_device = :id_dev
+                   AND command_uuid       = :cmd_uuid
+            """), {
+                "result_plist": result_json,
+                "id_dev": device_id,
+                "cmd_uuid": str(cmd_uuid),
+            })
+
         # Any other status → just 200 OK, empty body
         return Response(content=b"", media_type="application/xml")
 
 
 # Mount Apple MDM plist endpoints (no /api prefix, no JWT)
 app.include_router(mdm_plist_router)
+
+
+
+
+def load_profile_base64(path: str) -> str:
+    """
+    Reads a .mobileconfig profile from disk and returns base64 string
+    suitable for the InstallProfile 'Payload' field.
+    """
+    data = Path(path).read_bytes()
+    return base64.b64encode(data).decode("ascii")
+
+
 
 # === FCM (server → device) ===
 FCM_PROJECT_ID = must_get("FCM_PROJECT_ID")
